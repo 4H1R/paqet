@@ -9,9 +9,19 @@ import (
 	"github.com/goccy/go-yaml"
 )
 
-func TestRejectsMisplacedKeys(t *testing.T) {
-	// "conn" and "sockbuf" under kcp were previously ignored silently.
-	cfg := `role: "server"
+// paqctl-generated configs put conn and sockbuf under kcp. They must keep
+// loading (master ignored those keys) and the keys must be reported.
+const misplacedCfg = `role: "server"
+listen:
+  addr: ":9999"
+network:
+  interface: "lo"
+  ipv4:
+    addr: "127.0.0.1:9999"
+    router_mac: "aa:bb:cc:dd:ee:ff"
+  tcp:
+    local_flag: ["PA"]
+    typo_flag: ["S"]
 transport:
   protocol: "kcp"
   kcp:
@@ -19,21 +29,40 @@ transport:
     conn: 8
     sockbuf: 8388608
 `
-	path := filepath.Join(t.TempDir(), "c.yaml")
-	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := LoadFromFile(path)
-	if err == nil || !strings.Contains(err.Error(), "unknown field") {
-		t.Fatalf("expected unknown field error, got %v", err)
+
+func TestUnknownKeysReportedWithPaths(t *testing.T) {
+	got := unknownKeys([]byte(misplacedCfg))
+	want := []string{"network.tcp.typo_flag", "transport.kcp.conn", "transport.kcp.sockbuf"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("unknownKeys = %v, want %v", got, want)
 	}
 }
 
-func TestExamplesAreStrictlyValid(t *testing.T) {
+func TestUnknownKeysAreNotFatal(t *testing.T) {
+	var c Conf
+	if err := yaml.Unmarshal([]byte(misplacedCfg), &c); err != nil {
+		t.Fatalf("lenient parse must accept unknown keys: %v", err)
+	}
+	if c.Transport.KCP.Key != "k" || c.Listen.Addr_ != ":9999" {
+		t.Fatalf("known keys not decoded: %+v", c)
+	}
+}
+
+func TestUnknownKeysInLists(t *testing.T) {
+	cfg := "role: client\nforward:\n  - listen: \":1\"\n    target: \"x:1\"\n    protcol: tcp\n"
+	if got := unknownKeys([]byte(cfg)); len(got) != 1 || got[0] != "forward[0].protcol" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestExamplesHaveNoUnknownKeys(t *testing.T) {
 	for _, name := range []string{"client.yaml.example", "server.yaml.example"} {
 		data, err := os.ReadFile(filepath.Join("..", "..", "example", name))
 		if err != nil {
 			t.Fatal(err)
+		}
+		if keys := unknownKeys(data); len(keys) > 0 {
+			t.Errorf("%s: unknown keys %v", name, keys)
 		}
 		var c Conf
 		if err := yaml.UnmarshalWithOptions(data, &c, yaml.DisallowUnknownField()); err != nil {

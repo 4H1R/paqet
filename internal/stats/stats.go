@@ -40,13 +40,11 @@ func Format(prev, cur *kcp.Snmp, elapsed time.Duration, conns []tnet.Conn) strin
 		secs = 1
 	}
 	d := func(a, b uint64) uint64 { return b - a }
-	outSegs := d(prev.OutSegs, cur.OutSegs)
-	pct := func(n uint64) float64 {
-		if outSegs == 0 {
-			return 0
-		}
-		return 100 * float64(n) / float64(outSegs)
-	}
+	// Rates, not percentages: kcp-go's OutSegs also counts ACK segments, so
+	// a ratio against it understates loss badly on a receive-heavy side.
+	// Retransmits only cover what this side sends: check the server's stats
+	// for download health and the client's for upload.
+	rate := func(a, b uint64) float64 { return float64(d(a, b)) / secs }
 
 	var live, streams int
 	var minRTT, maxRTT, sumRTT time.Duration
@@ -68,12 +66,12 @@ func Format(prev, cur *kcp.Snmp, elapsed time.Duration, conns []tnet.Conn) strin
 		rtt = fmt.Sprintf("rtt=%v/%v/%v (min/avg/max)", minRTT, (sumRTT / time.Duration(live)).Round(time.Millisecond), maxRTT)
 	}
 
-	s := fmt.Sprintf("sessions=%d streams=%d %s rx=%.2fMbit/s tx=%.2fMbit/s retrans=%.2f%% lost=%.2f%% (fast=%d early=%d)",
+	s := fmt.Sprintf("sessions=%d streams=%d %s rx=%.2fMbit/s tx=%.2fMbit/s retrans=%.1f/s lost=%.1f/s (fast=%d early=%d)",
 		live, streams, rtt,
 		float64(d(prev.InBytes, cur.InBytes))*8/secs/1e6,
 		float64(d(prev.OutBytes, cur.OutBytes))*8/secs/1e6,
-		pct(d(prev.RetransSegs, cur.RetransSegs)),
-		pct(d(prev.LostSegs, cur.LostSegs)),
+		rate(prev.RetransSegs, cur.RetransSegs),
+		rate(prev.LostSegs, cur.LostSegs),
 		d(prev.FastRetransSegs, cur.FastRetransSegs),
 		d(prev.EarlyRetransSegs, cur.EarlyRetransSegs),
 	)

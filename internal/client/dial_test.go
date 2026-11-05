@@ -13,13 +13,19 @@ import (
 
 type fakeConn struct {
 	closed  atomic.Bool
+	refuse  atomic.Bool // refuse new streams while staying open, like smux ErrGoAway
 	streams int
 	opens   atomic.Int32
 }
 
+var errGoAway = errors.New("stream id overflows, should start a new connection")
+
 func (f *fakeConn) OpenStrm() (tnet.Strm, error) {
 	if f.closed.Load() {
 		return nil, net.ErrClosed
+	}
+	if f.refuse.Load() {
+		return nil, errGoAway
 	}
 	f.opens.Add(1)
 	c, _ := net.Pipe()
@@ -139,5 +145,78 @@ func TestClosedSlotStopsRetrying(t *testing.T) {
 	c := &Client{conns: []*timedConn{tc}}
 	if _, err := c.newStrm(context.Background()); !errors.Is(err, errClientClosed) {
 		t.Fatalf("got %v, want errClientClosed", err)
+	}
+}
+
+func TestNewStrmReplacesSessionThatRefusesStreams(t *testing.T) {
+	stuck := &fakeConn{streams: 2} // still carrying two live streams
+	stuck.refuse.Store(true)
+	fresh := &fakeConn{}
+	tc := slot(stuck, func() (tnet.Conn, error) { return fresh, nil })
+	c := &Client{conns: []*timedConn{tc}}
+
+	s, err := c.newStrm(context.Background())
+	if err != nil {
+		t.Fatalf("a session refusing streams must be replaced, got %v", err)
+	}
+	s.Close()
+	if fresh.opens.Load() != 1 {
+		t.Fatal("stream was not opened on the replacement session")
+	}
+	if stuck.IsClosed() {
+		t.Fatal("retired session was closed while it still had live streams")
+	}
+
+	tc.maintain()
+	if stuck.IsClosed() {
+		t.Fatal("maintain closed a retired session that still has streams")
+	}
+	stuck.streams = 0
+	tc.maintain()
+	if !stuck.IsClosed() {
+		t.Fatal("maintain should close a drained retired session")
+	}
+}
+
+func TestRetireIgnoresAlreadyReplacedSession(t *testing.T) {
+	old, cur := &fakeConn{}, &fakeConn{}
+	tc := slot(cur, noDial)
+	tc.retire(old) // a late caller still holding the previous session
+	if tc.current() != cur {
+		t.Fatal("retiring a stale session must not touch the current one")
+	}
+}
+
+func TestRetiredSessionsAreBounded(t *testing.T) {
+	tc := slot(nil, noDial)
+	var all []*fakeConn
+	for range maxRetired + 2 {
+		c := &fakeConn{streams: 1}
+		all = append(all, c)
+		tc.setLocked(c)
+		tc.retire(c)
+	}
+	if len(tc.retired) != maxRetired {
+		t.Fatalf("kept %d retired sessions, want %d", len(tc.retired), maxRetired)
+	}
+	if !all[0].IsClosed() || !all[1].IsClosed() {
+		t.Fatal("oldest retired sessions should be closed when over the bound")
+	}
+	tc.close()
+	for i, c := range all {
+		if !c.IsClosed() {
+			t.Fatalf("session %d left open after close", i)
+		}
+	}
+}
+
+func TestNewStrmReportsCallerCancellation(t *testing.T) {
+	c := &Client{conns: []*timedConn{slot(nil, func() (tnet.Conn, error) {
+		return nil, errors.New("server unreachable")
+	})}}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(80*time.Millisecond, cancel)
+	if _, err := c.newStrm(ctx); !errors.Is(err, context.Canceled) || errors.Is(err, errNoConn) {
+		t.Fatalf("caller cancellation should surface as context.Canceled, got %v", err)
 	}
 }

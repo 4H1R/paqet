@@ -34,7 +34,6 @@ func aplConf(conn *kcp.UDPSession, cfg *conf.KCP) {
 	conn.SetWriteDelay(wDelay)
 	conn.SetACKNoDelay(ackNoDelay)
 	conn.SetStreamMode(true)
-	conn.SetDSCP(46)
 }
 
 func smuxConf(cfg *conf.KCP) *smux.Config {

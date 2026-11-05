@@ -33,7 +33,7 @@ func TestFormat(t *testing.T) {
 		conn{rtt: 100 * time.Millisecond, streams: 1},
 		conn{rtt: time.Hour, closed: true}, // ignored
 	})
-	for _, want := range []string{"sessions=2", "streams=4", "rtt=80ms/90ms/100ms", "rx=10.00Mbit/s", "tx=1.00Mbit/s", "retrans=2.00%", "lost=0.50%"} {
+	for _, want := range []string{"sessions=2", "streams=4", "rtt=80ms/90ms/100ms", "rx=10.00Mbit/s", "tx=1.00Mbit/s", "retrans=20.0/s", "lost=5.0/s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in %q", want, got)
 		}
@@ -42,7 +42,7 @@ func TestFormat(t *testing.T) {
 
 func TestFormatIdle(t *testing.T) {
 	got := Format(&kcp.Snmp{}, &kcp.Snmp{}, 0, nil)
-	if !strings.Contains(got, "rtt=n/a") || !strings.Contains(got, "retrans=0.00%") {
+	if !strings.Contains(got, "rtt=n/a") || !strings.Contains(got, "retrans=0.0/s") {
 		t.Fatalf("unexpected idle output: %q", got)
 	}
 }

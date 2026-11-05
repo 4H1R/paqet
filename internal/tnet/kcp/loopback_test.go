@@ -195,13 +195,13 @@ func BenchmarkThroughput(b *testing.B) {
 		b.Run(tc.name, func(b *testing.B) {
 			n := &memNet{delay: tc.rtt / 2, loss: tc.loss}
 			cs, ss := pipe(b, n, testKCPConf(b, tc.mode, tc.sndwnd, tc.rcvwnd))
-			buf := make([]byte, chunk)
+			wbuf, rbuf := make([]byte, chunk), make([]byte, chunk)
 			b.SetBytes(chunk)
 			b.ResetTimer()
 			for range b.N {
 				errCh := make(chan error, 1)
-				go func() { _, err := cs.Write(buf); errCh <- err }()
-				if _, err := io.ReadFull(ss, buf); err != nil {
+				go func() { _, err := cs.Write(wbuf); errCh <- err }()
+				if _, err := io.ReadFull(ss, rbuf); err != nil {
 					b.Fatal(err)
 				}
 				if err := <-errCh; err != nil {

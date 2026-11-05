@@ -29,10 +29,14 @@ func LoadFromFile(path string) (*Conf, error) {
 
 	var conf Conf
 
-	// Reject unknown or misplaced keys: silently ignoring them hides typos
-	// such as a kcp option written at the wrong nesting level.
-	if err := yaml.UnmarshalWithOptions(data, &conf, yaml.DisallowUnknownField()); err != nil {
+	if err := yaml.Unmarshal(data, &conf); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	// Unknown or misplaced keys are ignored, as before, but no longer
+	// silently: they usually mean a setting the user thinks is applied is
+	// not. They are not fatal, so existing configs keep starting.
+	if keys := unknownKeys(data); len(keys) > 0 {
+		flog.Warnf("ignoring unknown config keys (misspelled or at the wrong level?): %s", strings.Join(keys, ", "))
 	}
 
 	validRoles := []string{"client", "server"}

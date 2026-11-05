@@ -32,20 +32,25 @@ func CopyT(dst io.Writer, src io.Reader) error {
 	}
 
 	bp := tcpPool.Get().(*[]byte)
-	defer tcpPool.Put(bp)
 	buf := *bp
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
 			w, werr := dst.Write(buf[:n])
 			if werr != nil {
+				// Deliberately not returned to the pool: a failed write may
+				// still be referenced by dst. smux, for one, returns as soon
+				// as the session dies while its send loop can still be
+				// reading the frame.
 				return werr
 			}
 			if w < n {
+				tcpPool.Put(bp)
 				return io.ErrShortWrite
 			}
 		}
 		if err != nil {
+			tcpPool.Put(bp)
 			return cleanEOF(err)
 		}
 	}

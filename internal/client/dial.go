@@ -43,18 +43,20 @@ func (c *Client) pick() *timedConn {
 	return best
 }
 
-func (c *Client) newStrm(ctx context.Context) (tnet.Strm, error) {
-	ctx, cancel := context.WithTimeout(ctx, retryWait)
+func (c *Client) newStrm(parent context.Context) (tnet.Strm, error) {
+	ctx, cancel := context.WithTimeout(parent, retryWait)
 	defer cancel()
 
 	delay := retryMin
 	for {
-		conn, err := c.pick().get()
+		tc := c.pick()
+		conn, err := tc.get()
 		if err == nil {
 			strm, serr := conn.OpenStrm()
 			if serr == nil {
 				return strm, nil
 			}
+			tc.retire(conn)
 			err = serr
 		}
 		if errors.Is(err, errClientClosed) {
@@ -64,6 +66,9 @@ func (c *Client) newStrm(ctx context.Context) (tnet.Strm, error) {
 
 		select {
 		case <-ctx.Done():
+			if perr := parent.Err(); perr != nil {
+				return nil, perr // the caller gave up, not the server
+			}
 			return nil, errors.Join(errNoConn, err)
 		case <-time.After(delay):
 		}
@@ -71,8 +76,8 @@ func (c *Client) newStrm(ctx context.Context) (tnet.Strm, error) {
 	}
 }
 
-// maintain periodically redials dead connections in the background so user
-// traffic does not pay the reconnect cost.
+// maintain periodically redials dead connections and closes drained retired
+// ones in the background.
 func (c *Client) maintain(ctx context.Context) {
 	t := time.NewTicker(maintainInterval)
 	defer t.Stop()

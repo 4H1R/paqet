@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,12 +26,17 @@ type timedConn struct {
 	cfg  *conf.Conf
 	dial func() (tnet.Conn, error)
 
-	mu     sync.Mutex // serializes redials and close
-	conn   tnet.Conn
-	closed bool
+	mu      sync.Mutex // serializes redials and close
+	conn    tnet.Conn
+	retired []tnet.Conn // replaced sessions, open until their streams finish
+	closed  bool
 
 	cur atomic.Pointer[connRef] // lock-free view of conn for pick()
 }
+
+// maxRetired bounds how many replaced sessions a slot keeps draining, in case
+// sessions keep failing faster than their streams finish.
+const maxRetired = 4
 
 func (tc *timedConn) setLocked(conn tnet.Conn) {
 	tc.conn = conn
@@ -100,27 +106,50 @@ func (tc *timedConn) current() tnet.Conn {
 	return nil
 }
 
-// maintain redials a dead session, or re-announces the TCP flags on a live
-// one so the server recovers them after a restart.
-func (tc *timedConn) maintain() {
+// retire takes conn out of service after it failed to open a stream. smux can
+// refuse new streams on a session that never reports IsClosed (ErrGoAway once
+// its stream IDs run out, ErrTimeout when badly congested), so without this
+// the slot would fail forever. The slot redials on next use; conn stays open
+// so its existing streams can finish, and maintain closes it once they have.
+func (tc *timedConn) retire(conn tnet.Conn) {
 	tc.mu.Lock()
-	if tc.closed {
-		tc.mu.Unlock()
+	defer tc.mu.Unlock()
+	if tc.closed || tc.conn != conn {
+		return // already replaced by another caller
+	}
+	tc.setLocked(nil)
+	if conn.IsClosed() {
+		conn.Close()
 		return
 	}
+	flog.Infof("connection stopped accepting streams, opening a new one")
+	if len(tc.retired) >= maxRetired {
+		tc.retired[0].Close()
+		tc.retired = tc.retired[1:]
+	}
+	tc.retired = append(tc.retired, conn)
+}
+
+// maintain closes drained retired sessions and redials a dead slot, so user
+// traffic does not pay the reconnect cost. It never opens streams, so a
+// congested session cannot stall it.
+func (tc *timedConn) maintain() {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.closed {
+		return
+	}
+	tc.retired = slices.DeleteFunc(tc.retired, func(c tnet.Conn) bool {
+		if c.IsClosed() || c.NumStreams() == 0 {
+			c.Close()
+			return true
+		}
+		return false
+	})
 	if tc.conn == nil || tc.conn.IsClosed() {
 		if _, err := tc.redialLocked(); err != nil {
 			flog.Debugf("background reconnect failed: %v", err)
 		}
-		tc.mu.Unlock()
-		return
-	}
-	conn := tc.conn
-	tc.mu.Unlock()
-
-	// Outside the lock: a congested session must not stall redials or close.
-	if err := sendTCPF(conn, tc.cfg.Network.TCP.RF); err != nil {
-		flog.Debugf("failed to refresh TCP flags: %v", err)
 	}
 }
 
@@ -132,6 +161,10 @@ func (tc *timedConn) close() {
 		tc.conn.Close()
 		tc.setLocked(nil)
 	}
+	for _, c := range tc.retired {
+		c.Close()
+	}
+	tc.retired = nil
 }
 
 func sendTCPF(conn tnet.Conn, f []conf.TCPF) error {

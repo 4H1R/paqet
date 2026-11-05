@@ -28,7 +28,8 @@ func (w *writerToReader) WriteTo(dst io.Writer) (int64, error) {
 func TestCopyTCleanEOF(t *testing.T) {
 	src := strings.Repeat("x", 3*TCPSize+7)
 	var dst bytes.Buffer
-	if err := CopyT(&dst, strings.NewReader(src)); err != nil {
+	// Hide strings.Reader's WriteTo so the pooled read/write loop is exercised.
+	if err := CopyT(&dst, struct{ io.Reader }{strings.NewReader(src)}); err != nil {
 		t.Fatal(err)
 	}
 	if dst.String() != src {
@@ -58,8 +59,32 @@ type errWriter struct{}
 func (errWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
 
 func TestCopyTWriteError(t *testing.T) {
-	if err := CopyT(errWriter{}, strings.NewReader("x")); err == nil {
+	if err := CopyT(errWriter{}, struct{ io.Reader }{strings.NewReader("x")}); err == nil {
 		t.Fatal("expected write error")
+	}
+}
+
+// retainingWriter keeps the slice it was given and fails, like a smux stream
+// whose session died while the frame was still queued.
+type retainingWriter struct{ kept []byte }
+
+func (w *retainingWriter) Write(p []byte) (int, error) {
+	w.kept = p
+	return 0, errors.New("session closed")
+}
+
+func TestCopyTDoesNotRecycleBufferAfterFailedWrite(t *testing.T) {
+	w := &retainingWriter{}
+	CopyT(w, struct{ io.Reader }{strings.NewReader("original")})
+
+	// A buffer returned to the pool would almost certainly be handed to the
+	// next copy and overwritten while w still references it.
+	for range 4 {
+		var dst bytes.Buffer
+		CopyT(&dst, struct{ io.Reader }{strings.NewReader("OVERWRITTEN")})
+	}
+	if string(w.kept) != "original" {
+		t.Fatalf("buffer still referenced by a failed write was reused: %q", w.kept)
 	}
 }
 
