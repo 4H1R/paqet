@@ -71,6 +71,20 @@ func (l Level) String() string {
 	return levelNames[l]
 }
 
+// Statsf logs a periodic statistics line. Stats are opt-in through config,
+// so they print at any level except none.
+func Statsf(format string, args ...any) {
+	if Level(lv.Load()) == None {
+		return
+	}
+	now := time.Now().Format("2006-01-02 15:04:05.000")
+	line := fmt.Sprintf("%s [STATS] %s\n", now, fmt.Sprintf(format, args...))
+	select {
+	case ch <- line:
+	default:
+	}
+}
+
 func Debugf(format string, args ...any) { logf(Debug, format, args...) }
 func Infof(format string, args ...any)  { logf(Info, format, args...) }
 func Warnf(format string, args ...any)  { logf(Warn, format, args...) }

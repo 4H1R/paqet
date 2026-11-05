@@ -29,8 +29,10 @@ func LoadFromFile(path string) (*Conf, error) {
 
 	var conf Conf
 
-	if err := yaml.Unmarshal(data, &conf); err != nil {
-		return nil, err
+	// Reject unknown or misplaced keys: silently ignoring them hides typos
+	// such as a kcp option written at the wrong nesting level.
+	if err := yaml.UnmarshalWithOptions(data, &conf, yaml.DisallowUnknownField()); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	validRoles := []string{"client", "server"}

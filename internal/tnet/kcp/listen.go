@@ -25,13 +25,22 @@ func Listen(cfg *conf.KCP, netCfg conf.Network) (tnet.Listener, error) {
 		return nil, fmt.Errorf("kcp: failed to create packetconn: %w", err)
 	}
 
-	l, err := kcp.ServeConn(cfg.Block, cfg.Dshard, cfg.Pshard, packetConn)
+	l, err := listenOn(cfg, packetConn)
 	if err != nil {
 		packetConn.Close()
+		return nil, err
+	}
+	l.PacketConn = packetConn
+	return l, nil
+}
+
+// listenOn serves KCP sessions over an existing packet conn.
+func listenOn(cfg *conf.KCP, pc net.PacketConn) (*Listener, error) {
+	l, err := kcp.ServeConn(cfg.Block, cfg.Dshard, cfg.Pshard, pc)
+	if err != nil {
 		return nil, fmt.Errorf("kcp: failed to serve connection: %w", err)
 	}
-
-	return &Listener{PacketConn: packetConn, cfg: cfg, listener: l}, nil
+	return &Listener{cfg: cfg, listener: l}, nil
 }
 
 func (l *Listener) Accept() (tnet.Conn, error) {

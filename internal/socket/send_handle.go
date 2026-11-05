@@ -46,6 +46,7 @@ type SendHandle struct {
 	srcIPv6     net.IP
 	srcIPv6RHWA net.HardwareAddr
 	srcPort     uint16
+	tos         uint8
 	time        uint32
 	tsCounter   atomic.Uint32
 	tcpF        tcpF
@@ -72,6 +73,7 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 	sh := &SendHandle{
 		handle:  handle,
 		srcPort: uint16(cfg.Port),
+		tos:     uint8(cfg.DSCP << 2),
 		tcpF:    tcpF{tcpF: iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF}, clientTCPF: make(map[uint64]*iterator.Iterator[conf.TCPF])},
 		time:    uint32(time.Now().UnixNano() / int64(time.Millisecond)),
 		ePool: sync.Pool{
@@ -100,7 +102,7 @@ func (h *SendHandle) buildIPv4Header(e *encoder, dstIP net.IP) {
 	e.ip4 = layers.IPv4{
 		Version:  4,
 		IHL:      5,
-		TOS:      184,
+		TOS:      h.tos,
 		TTL:      64,
 		Flags:    layers.IPv4DontFragment,
 		Protocol: layers.IPProtocolTCP,
@@ -112,7 +114,7 @@ func (h *SendHandle) buildIPv4Header(e *encoder, dstIP net.IP) {
 func (h *SendHandle) buildIPv6Header(e *encoder, dstIP net.IP) {
 	e.ip6 = layers.IPv6{
 		Version:      6,
-		TrafficClass: 184,
+		TrafficClass: h.tos,
 		HopLimit:     64,
 		NextHeader:   layers.IPProtocolTCP,
 		SrcIP:        h.srcIPv6,

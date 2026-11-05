@@ -1,9 +1,12 @@
 package conf
 
 import (
+	goerrors "errors"
 	"fmt"
 	"slices"
 	"time"
+
+	"paqet/internal/flog"
 
 	"github.com/xtaci/kcp-go/v5"
 )
@@ -93,6 +96,9 @@ func (k *KCP) validate() []error {
 	if !slices.Contains(validModes, k.Mode) {
 		errors = append(errors, fmt.Errorf("KCP mode must be one of: %v", validModes))
 	}
+	if k.Mode != "manual" && (k.NoDelay != 0 || k.Interval != 0 || k.Resend != 0 || k.NoCongestion != 0 || k.WDelay || k.AckNoDelay) {
+		flog.Warnf("KCP nodelay/interval/resend/nocongestion/wdelay/acknodelay are ignored unless mode is \"manual\" (mode is %q)", k.Mode)
+	}
 
 	if k.MTU < 50 || k.MTU > 1500 {
 		errors = append(errors, fmt.Errorf("KCP MTU must be between 50-1500 bytes"))
@@ -129,4 +135,11 @@ func (k *KCP) validate() []error {
 	k.Smuxktimeout = time.Duration(k.Smuxktimeout_) * time.Second
 
 	return errors
+}
+
+// Init applies defaults for role and validates k on its own, outside a full
+// configuration file. It is used by tests and embedders.
+func (k *KCP) Init(role string) error {
+	k.setDefaults(role)
+	return goerrors.Join(k.validate()...)
 }

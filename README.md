@@ -234,6 +234,26 @@ The `transport.kcp.block` parameter determines the encryption method.
 
 The `network.tcp.local_flag` and `network.tcp.remote_flag` arrays cycle through flag combinations to vary traffic patterns. Common patterns: `["PA"]` (standard data), `["S"]` (connection setup), `["A"]` (acknowledgment).
 
+### Strict Configuration
+
+Unknown or misplaced keys are rejected at startup with the offending line, instead of being silently ignored. A common mistake is putting `conn` under `kcp` (it belongs at `transport.conn`) or `sockbuf` under `kcp` (it belongs at `network.pcap.sockbuf`). The manual KCP values (`nodelay`, `interval`, `resend`, `nocongestion`, `wdelay`, `acknodelay`) only apply with `mode: "manual"`, and paqet warns if they are set in any other mode.
+
+### Performance Tuning
+
+Set `log.stats_interval: 30` to log throughput, smoothed RTT, retransmit and loss rates every 30 seconds:
+
+```
+[STATS] sessions=8 streams=23 rtt=82ms/88ms/97ms (min/avg/max) rx=41.20Mbit/s tx=2.10Mbit/s retrans=0.80% lost=0.30% (fast=12 early=0)
+```
+
+- **Throughput is capped by the KCP windows.** A single stream moves at most `window × ~1300 bytes` per round trip, where the window is `min(sender sndwnd, receiver rcvwnd)`. Download speed depends on the server `sndwnd` and the client `rcvwnd`. Upload speed depends on the client `sndwnd` and the server `rcvwnd`. Each `transport.conn` is a separate session with its own window, but one stream only ever uses one session.
+- **High `retrans`/`lost` with ping spikes under load** means the windows are larger than the link can carry. Lower them, or enable FEC (`dshard`/`pshard`) on lossy links.
+- **Benchmark settings without a network** using the in-memory link simulator:
+
+  ```bash
+  go test ./internal/tnet/kcp -run x -bench Throughput -benchtime 4x
+  ```
+
 # Architecture & Security Model
 
 ### The `pcap` Approach and Firewall Bypass

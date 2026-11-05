@@ -23,16 +23,8 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *request)
 		return
 	}
 
-	errCh := make(chan error, 2)
-	go func() { errCh <- buffer.CopyT(conn, strm) }()
-	go func() { errCh <- buffer.CopyT(strm, conn) }()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			flog.Errorf("SOCKS5 TCP stream %d failed for %s -> %s: %v", strm.SID(), conn.RemoteAddr(), req.address(), err)
-		}
-	case <-ctx.Done():
+	if err := buffer.Relay(ctx, conn, strm); err != nil {
+		flog.Errorf("SOCKS5 TCP stream %d failed for %s -> %s: %v", strm.SID(), conn.RemoteAddr(), req.address(), err)
 	}
 
 	flog.Debugf("SOCKS5 connection %s -> %s closed", conn.RemoteAddr(), req.address())

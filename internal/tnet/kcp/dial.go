@@ -19,19 +19,28 @@ func Dial(addr *net.UDPAddr, cfg *conf.KCP, netCfg conf.Network) (tnet.Conn, err
 		return nil, fmt.Errorf("kcp: failed to create packetconn: %w", err)
 	}
 
-	conn, err := kcp.NewConn(addr.String(), cfg.Block, cfg.Dshard, cfg.Pshard, packetConn)
+	conn, err := dialOn(addr, cfg, packetConn)
 	if err != nil {
 		packetConn.Close()
+		return nil, err
+	}
+	conn.PacketConn = packetConn
+	return conn, nil
+}
+
+// dialOn opens a KCP+smux client session over an existing packet conn.
+func dialOn(addr net.Addr, cfg *conf.KCP, pc net.PacketConn) (*Conn, error) {
+	sess, err := kcp.NewConn(addr.String(), cfg.Block, cfg.Dshard, cfg.Pshard, pc)
+	if err != nil {
 		return nil, fmt.Errorf("kcp: failed to dial connection: %w", err)
 	}
-	aplConf(conn, cfg)
+	aplConf(sess, cfg)
 
-	sess, err := smux.Client(conn, smuxConf(cfg))
+	mux, err := smux.Client(sess, smuxConf(cfg))
 	if err != nil {
-		conn.Close()
-		packetConn.Close()
+		sess.Close()
 		return nil, fmt.Errorf("kcp: failed to create smux session: %w", err)
 	}
 
-	return &Conn{packetConn, conn, sess}, nil
+	return &Conn{UDPSession: sess, Session: mux}, nil
 }

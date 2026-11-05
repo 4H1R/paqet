@@ -20,13 +20,22 @@ type Network struct {
 	IPv6       Addr           `yaml:"ipv6"`
 	PCAP       PCAP           `yaml:"pcap"`
 	TCP        TCP            `yaml:"tcp"`
+	DSCP_      *int           `yaml:"dscp"`
 	Interface  *net.Interface `yaml:"-"`
 	Port       int            `yaml:"-"`
+	DSCP       int            `yaml:"-"`
 }
+
+// defaultDSCP is Expedited Forwarding (46), the historical hardcoded value.
+const defaultDSCP = 46
 
 func (n *Network) setDefaults(role string) {
 	n.PCAP.setDefaults(role)
 	n.TCP.setDefaults()
+	n.DSCP = defaultDSCP
+	if n.DSCP_ != nil {
+		n.DSCP = *n.DSCP_
+	}
 }
 
 func (n *Network) validate() []error {
@@ -70,6 +79,10 @@ func (n *Network) validate() []error {
 	}
 	if ipv6OK {
 		n.Port = n.IPv6.Addr.Port
+	}
+
+	if n.DSCP < 0 || n.DSCP > 63 {
+		errors = append(errors, fmt.Errorf("network dscp must be between 0-63"))
 	}
 
 	errors = append(errors, n.PCAP.validate()...)
