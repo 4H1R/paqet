@@ -162,6 +162,14 @@ sudo iptables -t filter -A OUTPUT -p tcp --sport <PORT> -j ACCEPT
 
 These rules ensure that only the application handles traffic for the connection port.
 
+**Lower-CPU alternative (Linux).** paqet captures packets with a packet socket, which sees them *before* netfilter. Dropping them in the `raw` table therefore still delivers them to paqet, but the kernel no longer pushes every packet through its TCP stack only to discard the RST it answers with. This replaces both rules above:
+
+```bash
+sudo iptables -t raw -A PREROUTING -p tcp --dport <PORT> -j DROP
+```
+
+In the project's veth benchmark this cut paqet's CPU per transferred GB by a further 30-45% on both ends. It only applies to the paqet port, and like the rules above it must not be used on a port other services need.
+
 ### 3. Run `paqet`
 
 Make the downloaded binary executable (`chmod +x ./paqet_linux_amd64`). You will need root privileges to use raw sockets.
@@ -249,6 +257,9 @@ Set `log.stats_interval: 30` to log throughput, smoothed RTT, retransmit and los
 - **Throughput is capped by the KCP windows.** A single stream moves at most `window × ~1300 bytes` per round trip, where the window is `min(sender sndwnd, receiver rcvwnd)`. Download speed depends on the server `sndwnd` and the client `rcvwnd`. Upload speed depends on the client `sndwnd` and the server `rcvwnd`. Each `transport.conn` is a separate session with its own window, but one stream only ever uses one session.
 - **`retrans` and `lost` are segments per second, and only for what this side sends.** Judge download health from the server's stats and upload health from the client's. Compare them with the send rate: one segment is about `mtu` bytes, so at `tx=10Mbit/s` with `mtu: 1400` roughly 900 segments/s go out.
 - **Rising `retrans`/`lost` with ping spikes under load** means the windows are larger than the link can carry. Lower them, or enable FEC (`dshard`/`pshard`) on lossy links.
+- **`capture_drops`** appears when the kernel dropped received packets because the capture buffer was full. KCP retransmits them, so they cost bandwidth and latency. Raise `network.pcap.sockbuf` if you see it regularly.
+- **Packet capture backend.** On Linux paqet uses `AF_PACKET` directly (`network.pcap.backend: auto`): packets are read from and written to memory-mapped rings shared with the kernel, with no system call per packet under load. Set `backend: libpcap` to go back to libpcap. Other systems always use libpcap/Npcap.
+- **Server receive parallelism.** On Linux the server splits incoming packets over `network.pcap.readers` sockets by flow (default: one per CPU, up to 4), each decrypting and processing its own clients on its own core. One client always stays on one reader, so this helps servers with several clients, not a single fast one. The capture buffer is divided between the readers.
 - **Benchmark settings without a network** using the in-memory link simulator:
 
   ```bash

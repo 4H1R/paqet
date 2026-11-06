@@ -284,7 +284,7 @@ func (r *ringRx) close() {
 }
 
 func newAFPacketTx(cfg *conf.Network) (txSink, error) {
-	t, err := newRingTx(cfg.Interface.Index)
+	t, err := newRingTx(cfg.Interface.Index, txRingFramesFor(cfg.PCAP.Sockbuf))
 	if err == nil {
 		return t, nil
 	}
@@ -316,15 +316,22 @@ type ringTx struct {
 	err  atomic.Pointer[error]
 }
 
+// txRingFramesFor sizes the transmit ring at a quarter of the receive
+// buffer: 512 frames (1MB) for the client default and 1024 (2MB) for the
+// server default, enough for a full KCP send window. A full ring only
+// makes writers wait, like a full socket buffer does.
+func txRingFramesFor(sockbuf int) int {
+	return min(max(sockbuf/4/ringFrameSize, 128), 4096)
+}
+
 const (
-	txRingFrames = 1024 // 2MB; one KCP flush of the default windows fits
 	// txDataOff is where frame data starts in a TX slot: TPACKET2_HDRLEN
 	// minus the sockaddr_ll the kernel expects in front of it.
 	txDataOff  = 32
 	txMaxFrame = ringFrameSize - txDataOff
 )
 
-func newRingTx(ifindex int) (*ringTx, error) {
+func newRingTx(ifindex, frames int) (*ringTx, error) {
 	// Protocol 0: the socket only sends and never queues received frames.
 	// The kernel infers each frame's protocol from its Ethernet header.
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
@@ -347,7 +354,7 @@ func newRingTx(ifindex int) (*ringTx, error) {
 		return fail("PACKET_LOSS", err)
 	}
 	perBlock := ringBlockSize / ringFrameSize
-	blocks := (txRingFrames + perBlock - 1) / perBlock
+	blocks := (frames + perBlock - 1) / perBlock
 	req := unix.TpacketReq{
 		Block_size: ringBlockSize,
 		Block_nr:   uint32(blocks),
