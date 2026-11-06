@@ -114,31 +114,35 @@ func (d *datagram) bytes() []byte {
 	return append(buf, d.data...)
 }
 
-func decodeDatagram(p []byte) (*datagram, error) {
+// decodeDatagram parses a SOCKS5 UDP request header. key is the raw
+// address part (ATYP through PORT), usable as an allocation-free map key.
+// All returned slices alias p.
+func decodeDatagram(p []byte) (d datagram, key []byte, err error) {
 	if len(p) < 4 || p[2] != 0 {
-		return nil, errProtocol
+		return d, nil, errProtocol
 	}
 	atyp, rest := p[3], p[4:]
 	var addr []byte
 	switch atyp {
 	case atypIPv4:
 		if len(rest) < net.IPv4len+2 {
-			return nil, errProtocol
+			return d, nil, errProtocol
 		}
 		addr, rest = rest[:net.IPv4len], rest[net.IPv4len:]
 	case atypIPv6:
 		if len(rest) < net.IPv6len+2 {
-			return nil, errProtocol
+			return d, nil, errProtocol
 		}
 		addr, rest = rest[:net.IPv6len], rest[net.IPv6len:]
 	case atypDomain:
 		if len(rest) < 1 || len(rest) < 1+int(rest[0])+2 {
-			return nil, errProtocol
+			return d, nil, errProtocol
 		}
 		n := int(rest[0])
 		addr, rest = rest[1:1+n], rest[1+n:]
 	default:
-		return nil, errProtocol
+		return d, nil, errProtocol
 	}
-	return &datagram{atyp: atyp, addr: addr, port: rest[:2], data: rest[2:]}, nil
+	hdrEnd := len(p) - len(rest) + 2
+	return datagram{atyp: atyp, addr: addr, port: rest[:2], data: rest[2:]}, p[3:hdrEnd], nil
 }

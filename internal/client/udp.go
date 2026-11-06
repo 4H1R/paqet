@@ -15,7 +15,9 @@ func (c *Client) UDP(ctx context.Context, lAddr, tAddr string) (tnet.Strm, bool,
 	if u, ok := c.udpPool.strms[key]; ok {
 		c.udpPool.mark(u)
 		c.udpPool.mu.RUnlock()
-		flog.Debugf("reusing UDP stream %d for %s -> %s", u.strm.SID(), lAddr, tAddr)
+		if flog.Enabled(flog.Debug) {
+			flog.Debugf("reusing UDP stream %d for %s -> %s", u.strm.SID(), lAddr, tAddr)
+		}
 		return u.strm, false, key, nil
 	}
 	c.udpPool.mu.RUnlock()

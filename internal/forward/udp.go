@@ -13,7 +13,7 @@ import (
 
 type udpSess struct {
 	strm  tnet.Strm
-	ch    chan []byte
+	ch    chan *[]byte // pooled datagram buffers, see buffer.GetUDP
 	done  chan struct{}
 	key   uint64
 	close sync.Once
@@ -42,11 +42,12 @@ func (f *Forward) serveUDP(ctx context.Context, conn *net.UDPConn) {
 		if len(s.ch) == cap(s.ch) {
 			continue
 		}
-		d := make([]byte, n)
-		copy(d, buf[:n])
+		bp := buffer.GetUDP()
+		*bp = (*bp)[:copy(*bp, buf[:n])]
 		select {
-		case s.ch <- d:
+		case s.ch <- bp:
 		default:
+			buffer.PutUDP(bp)
 		}
 	}
 }
@@ -64,7 +65,7 @@ func (f *Forward) openUDPSess(ctx context.Context, conn *net.UDPConn, cAddr neti
 	if sess, ok := f.udpPool[cAddr]; ok {
 		return sess
 	}
-	sess := &udpSess{ch: make(chan []byte, 64), done: make(chan struct{})}
+	sess := &udpSess{ch: make(chan *[]byte, 64), done: make(chan struct{})}
 	f.udpPool[cAddr] = sess
 	go f.udpToStrm(ctx, conn, cAddr, sess)
 	return sess
@@ -93,12 +94,14 @@ func (f *Forward) udpToStrm(ctx context.Context, conn *net.UDPConn, cAddr netip.
 			return
 		case <-sess.done:
 			return
-		case buf := <-sess.ch:
-			_, err = strm.Write(buf)
+		case bp := <-sess.ch:
+			_, err = strm.Write(*bp)
 			if err != nil {
+				// Not recycled: a failed smux write may still reference it.
 				flog.Errorf("failed to forward bytes from %s -> %s: %v", cAddr, f.targetAddr, err)
 				return
 			}
+			buffer.PutUDP(bp)
 			f.client.Touch(sess.key)
 		}
 	}

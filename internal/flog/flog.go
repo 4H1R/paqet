@@ -37,6 +37,14 @@ func init() {
 
 func SetLevel(l int) { lv.Store(int32(l)) }
 
+// Enabled reports whether messages at level l are logged. Hot paths check
+// it before calling a log function, because passing arguments to a
+// variadic ...any boxes them even when the message is then discarded.
+func Enabled(l Level) bool {
+	mlv := Level(lv.Load())
+	return mlv != None && l >= mlv
+}
+
 func logf(l Level, format string, args ...any) {
 	mlv := Level(lv.Load())
 	if mlv == None || l < mlv {
