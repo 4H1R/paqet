@@ -5,6 +5,7 @@ package stats
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/kcp-go/v5"
@@ -38,6 +39,11 @@ func Run(ctx context.Context, interval time.Duration, conns func() []tnet.Conn) 
 			prev, last = cur, now
 		}
 	}
+}
+
+// Traffic returns the bytes KCP has sent and received so far.
+func Traffic() uint64 {
+	return atomic.LoadUint64(&kcp.DefaultSnmp.InBytes) + atomic.LoadUint64(&kcp.DefaultSnmp.OutBytes)
 }
 
 // Format renders the delta between two snapshots taken elapsed apart.

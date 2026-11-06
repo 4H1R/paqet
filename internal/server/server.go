@@ -7,6 +7,7 @@ import (
 
 	"paqet/internal/conf"
 	"paqet/internal/flog"
+	"paqet/internal/pkg/memtrim"
 	"paqet/internal/stats"
 	"paqet/internal/tnet"
 	"paqet/internal/tnet/kcp"
@@ -34,6 +35,7 @@ func (s *Server) Start(ctx context.Context) error {
 	flog.Infof("server listening for packets on :%d", s.cfg.Listen.Addr.Port)
 
 	go s.listen(ctx, listener)
+	go memtrim.Run(ctx, stats.Traffic)
 	context.AfterFunc(ctx, func() { listener.Close() })
 	if s.cfg.Log.StatsInterval > 0 {
 		go stats.Run(ctx, s.cfg.Log.StatsInterval, s.sessions)
