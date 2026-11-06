@@ -89,6 +89,7 @@ func (c *Conf) validate() error {
 
 	allErrors = append(allErrors, c.Network.validate()...)
 	allErrors = append(allErrors, c.Transport.validate()...)
+	c.warnOversizedPackets()
 	if c.Role == "server" {
 		allErrors = append(allErrors, c.Listen.validate()...)
 	} else {
@@ -107,6 +108,30 @@ func (c *Conf) validate() error {
 		}
 	}
 	return writeErr(allErrors)
+}
+
+// warnOversizedPackets warns when KCP packets cannot fit the interface MTU.
+// Such frames are dropped by the kernel or NIC, which looks like a tunnel
+// that connects but stalls as soon as real data flows.
+func (c *Conf) warnOversizedPackets() {
+	if c.Network.Interface == nil || c.Transport.KCP == nil {
+		return
+	}
+	ifaceMTU := c.Network.Interface.MTU
+	if ifaceMTU <= 0 {
+		return
+	}
+	// Largest IP packet paqet sends: IPv6 (40) or IPv4 (20) plus a TCP
+	// header with options (up to 40).
+	ipHdr := 20
+	if c.Network.IPv6.Addr != nil {
+		ipHdr = 40
+	}
+	overhead := ipHdr + 40
+	if mtu := c.Transport.KCP.MTU; mtu+overhead > ifaceMTU {
+		flog.Warnf("transport.kcp.mtu %d plus %d bytes of IP/TCP headers exceeds the MTU of %s (%d): large packets will be dropped. Set transport.kcp.mtu to %d or less",
+			mtu, overhead, c.Network.Interface.Name, ifaceMTU, ifaceMTU-overhead)
+	}
 }
 
 func writeErr(allErrors []error) error {
