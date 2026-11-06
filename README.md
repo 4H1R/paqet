@@ -168,7 +168,7 @@ These rules ensure that only the application handles traffic for the connection 
 sudo iptables -t raw -A PREROUTING -p tcp --dport <PORT> -j DROP
 ```
 
-In the project's veth benchmark this cut paqet's CPU per transferred GB by a further 30-45% on both ends. It only applies to the paqet port, and like the rules above it must not be used on a port other services need.
+In a veth benchmark this cut paqet's CPU per transferred GB by roughly a further 30% on both ends (part of that is the receiving kernel's work, which a veth pair charges to the sender). It only applies to the paqet port, and like the rules above it must not be used on a port other services need.
 
 ### 3. Run `paqet`
 
@@ -259,7 +259,7 @@ Set `log.stats_interval: 30` to log throughput, smoothed RTT, retransmit and los
 - **Rising `retrans`/`lost` with ping spikes under load** means the windows are larger than the link can carry. Lower them, or enable FEC (`dshard`/`pshard`) on lossy links.
 - **`capture_drops`** appears when the kernel dropped received packets because the capture buffer was full. KCP retransmits them, so they cost bandwidth and latency. Raise `network.pcap.sockbuf` if you see it regularly.
 - **Packet capture backend.** On Linux paqet uses `AF_PACKET` directly (`network.pcap.backend: auto`): packets are read from and written to memory-mapped rings shared with the kernel, with no system call per packet under load. Set `backend: libpcap` to go back to libpcap. Other systems always use libpcap/Npcap.
-- **Server receive parallelism.** On Linux the server splits incoming packets over `network.pcap.readers` sockets by flow (default: one per CPU, up to 4), each decrypting and processing its own clients on its own core. One client always stays on one reader, so this helps servers with several clients, not a single fast one. The capture buffer is divided between the readers.
+- **Server receive parallelism (experimental).** On Linux, `network.pcap.readers: N` splits incoming packets over N sockets by flow, each decrypting and processing its own clients on its own goroutine. One client always stays on one reader, so it can only help a server with several busy clients; with one client it costs a little CPU. The capture buffer is divided between the readers. Default: 1.
 - **Benchmark settings without a network** using the in-memory link simulator:
 
   ```bash

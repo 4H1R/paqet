@@ -371,6 +371,12 @@ func newRingTx(ifindex, frames int) (*ringTx, error) {
 	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Ifindex: ifindex}); err != nil {
 		return fail("bind", err)
 	}
+	// Bound the flusher's wait for frames to leave, so close never hangs
+	// on a stuck device.
+	tv := unix.Timeval{Sec: 1}
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &tv); err != nil {
+		return fail("SO_SNDTIMEO", err)
+	}
 	t.wg.Add(1)
 	go t.flushLoop()
 	return t, nil
@@ -447,13 +453,19 @@ func (t *ringTx) flushLoop() {
 			if errno == unix.EINTR {
 				continue
 			}
-			if errno != 0 {
+			switch errno {
+			case 0:
+			case unix.ENOBUFS, unix.EAGAIN, unix.ETIMEDOUT:
+				// Congestion, or the send timeout while waiting for frames
+				// to leave: the frames stay queued, so try again shortly.
+				// Reporting these would make kcp-go drop the session.
+				time.Sleep(100 * time.Microsecond)
+				continue
+			default:
+				// The interface went away or down. Like a failed sendto,
+				// report it so sessions notice.
 				err := error(errno)
 				t.err.Store(&err)
-				if errno == unix.ENOBUFS || errno == unix.EAGAIN {
-					time.Sleep(100 * time.Microsecond)
-					continue
-				}
 			}
 			break
 		}
