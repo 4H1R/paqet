@@ -17,6 +17,7 @@ import (
 // ReadFrom: a goroutine decodes each frame and hands kcp-go the payload
 // straight from the capture buffer.
 type PacketConn struct {
+	local         *Addr
 	send          *sendHandle
 	recv          *recvHandle
 	readDeadline  atomic.Value
@@ -39,7 +40,22 @@ func New(cfg *conf.Network) (*PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PacketConn{send: newSendHandle(cfg, tx), recv: newRecvHandle(rx, cfg.Port)}, nil
+	return &PacketConn{
+		local: localAddr(cfg),
+		send:  newSendHandle(cfg, tx),
+		recv:  newRecvHandle(rx, cfg.Port),
+	}, nil
+}
+
+// localAddr is the configured source address (IPv4 preferred) on cfg.Port.
+func localAddr(cfg *conf.Network) *Addr {
+	ip := net.IPv4zero
+	if cfg.IPv4.Addr != nil {
+		ip = cfg.IPv4.Addr.IP
+	} else if cfg.IPv6.Addr != nil {
+		ip = cfg.IPv6.Addr.IP
+	}
+	return NewAddr(ip, cfg.Port)
 }
 
 // SetPacketReceiver implements kcp-go's PacketPusher. fn is never called
@@ -136,7 +152,12 @@ func (c *PacketConn) Close() error {
 	return nil
 }
 
-func (c *PacketConn) LocalAddr() net.Addr { return nil }
+func (c *PacketConn) LocalAddr() net.Addr {
+	if c.local == nil {
+		return nil // never wrap a nil *Addr: its String would panic
+	}
+	return c.local
+}
 
 func (c *PacketConn) SetDeadline(t time.Time) error {
 	c.readDeadline.Store(t)

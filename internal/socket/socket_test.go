@@ -138,6 +138,36 @@ func TestReadFromAndWriteTo(t *testing.T) {
 	}
 }
 
+func TestLocalAddr(t *testing.T) {
+	v4 := testNetConf(9999)
+	v6 := &conf.Network{Port: 8443}
+	v6.IPv6.Addr = &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 8443}
+	both := testNetConf(7000)
+	both.IPv6.Addr = &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 7000}
+	for _, tc := range []struct {
+		name string
+		cfg  *conf.Network
+		want string
+	}{
+		{"ipv4", v4, "10.0.0.1:9999"},
+		{"ipv6 only", v6, "[2001:db8::1]:8443"},
+		{"ipv4 preferred", both, "10.0.0.1:7000"},
+		{"none", &conf.Network{Port: 1234}, "0.0.0.0:1234"},
+	} {
+		if got := localAddr(tc.cfg); got.String() != tc.want || got.Network() != "udp" {
+			t.Errorf("%s: localAddr = %s/%s, want %s/udp", tc.name, got.Network(), got, tc.want)
+		}
+	}
+
+	c := &PacketConn{local: localAddr(v4)}
+	if a := c.LocalAddr(); a == nil || a.String() != "10.0.0.1:9999" {
+		t.Fatalf("LocalAddr = %v", a)
+	}
+	if a := (&PacketConn{}).LocalAddr(); a != nil {
+		t.Fatalf("LocalAddr without an address = %#v, want untyped nil", a)
+	}
+}
+
 func TestReadDeadline(t *testing.T) {
 	c, _, _ := testConn(t, 9999)
 	defer c.Close()
