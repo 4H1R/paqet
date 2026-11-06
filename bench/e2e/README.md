@@ -125,6 +125,30 @@ collected every 2 minutes, which is why RSS only drops by the 300 s mark).
 | decode one frame | ~107 ns | ~4 ns |
 | `addr.String()` per received packet (kcp-go Listener) | 56 ns, 3 allocs | cached, 0 allocs |
 
+## Follow-up changes
+
+Measured the same way, each against the commit before it (median of 3
+runs, CPU seconds per GB, client / server):
+
+| change | upload | download |
+|---|---|---|
+| receive ring waits through Go's netpoller | 8.22 / 5.87 → 6.79 / 4.91 (-17% / -16%) | 5.81 / 7.80 → 4.77 / 6.26 (-18% / -20%) |
+
+Returning freed memory to the OS once traffic goes quiet, with 2,000 idle
+connections (RSS, client / server):
+
+| | after 30 s | after 300 s |
+|---|---:|---:|
+| before | 120 / 135 MB | 83 / 104 MB |
+| after | 50 / 62 MB | 50 / 63 MB |
+
+Tried and dropped:
+
+- **Non-blocking TX ring flush** (`MSG_DONTWAIT`): no difference beyond noise.
+- **Npcap send queues on Windows** (one kernel call per burst instead of per
+  packet), measured with the client on Windows and the server in WSL: no
+  lower CPU per GB, and ~7% less download throughput.
+
 ## Reading the numbers
 
 - **The biggest single CPU cost was the system call per sent packet** (~60%
