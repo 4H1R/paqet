@@ -10,6 +10,7 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 
 	"paqet/internal/flog"
+	"paqet/internal/socket"
 	"paqet/internal/tnet"
 )
 
@@ -20,6 +21,7 @@ func Run(ctx context.Context, interval time.Duration, conns func() []tnet.Conn) 
 	defer t.Stop()
 
 	prev := kcp.DefaultSnmp.Copy()
+	prevDrops := socket.Drops()
 	last := time.Now()
 	for {
 		select {
@@ -27,7 +29,14 @@ func Run(ctx context.Context, interval time.Duration, conns func() []tnet.Conn) 
 			return
 		case now := <-t.C:
 			cur := kcp.DefaultSnmp.Copy()
-			flog.Statsf("%s", Format(prev, cur, now.Sub(last), conns()))
+			line := Format(prev, cur, now.Sub(last), conns())
+			// Frames the kernel dropped because the capture buffer was
+			// full: KCP retransmits them, so any are worth knowing about.
+			if drops := socket.Drops(); drops > prevDrops {
+				line += fmt.Sprintf(" capture_drops=%d", drops-prevDrops)
+				prevDrops = drops
+			}
+			flog.Statsf("%s", line)
 			prev, last = cur, now
 		}
 	}
