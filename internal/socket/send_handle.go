@@ -1,17 +1,11 @@
 package socket
 
 import (
-	"encoding/binary"
-	"fmt"
+	"errors"
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
 
 	"paqet/internal/conf"
 	"paqet/internal/pkg/hash"
@@ -24,182 +18,95 @@ type tcpF struct {
 	mu         sync.RWMutex
 }
 
-type encoder struct {
-	eth layers.Ethernet
-	ip4 layers.IPv4
-	ip6 layers.IPv6
-	tcp layers.TCP
-
-	opts [5]layers.TCPOption
-	ts   [8]byte
-	mss  [2]byte
-	ws   [1]byte
-
-	buf gopacket.SerializeBuffer
-}
-
+// SendHandle builds frames and hands them to a transmit sink. It is safe
+// for concurrent use and can be shared by several PacketConns.
 type SendHandle struct {
-	handle      *pcap.Handle
-	writeMu     sync.Mutex
-	srcIPv4     net.IP
-	srcIPv4RHWA net.HardwareAddr
-	srcIPv6     net.IP
-	srcIPv6RHWA net.HardwareAddr
-	srcPort     uint16
-	tos         uint8
-	time        uint32
-	tsCounter   atomic.Uint32
-	tcpF        tcpF
-	ePool       sync.Pool
+	sink      txSink
+	v4, v6    frameAddrs // templates; dstIP is filled in per packet
+	srcPort   uint16
+	time      uint32
+	tsCounter atomic.Uint32
+	tcpF      tcpF
+	bufs      sync.Pool // *[]byte frame buffers
 }
 
-func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
-	handle, err := newHandle(cfg, 256*1024, 128, pcap.BlockForever)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open pcap handle: %w", err)
-	}
+var (
+	errNoIPv4 = errors.New("socket: no IPv4 address configured")
+	errNoIPv6 = errors.New("socket: no IPv6 address configured")
+)
 
-	// SetDirection is not fully supported on Windows Npcap, so skip it
-	if runtime.GOOS != "windows" {
-		if err := handle.SetDirection(pcap.DirectionOut); err != nil {
-			return nil, fmt.Errorf("failed to set pcap direction out: %v", err)
-		}
-	}
-
-	if err := handle.SetBPFFilter("less 0"); err != nil {
-		return nil, fmt.Errorf("failed to set BPF filter: %w", err)
-	}
-
+func newSendHandle(cfg *conf.Network, sink txSink) *SendHandle {
 	sh := &SendHandle{
-		handle:  handle,
+		sink:    sink,
 		srcPort: uint16(cfg.Port),
-		tos:     uint8(cfg.DSCP << 2),
 		tcpF:    tcpF{tcpF: iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF}, clientTCPF: make(map[uint64]*iterator.Iterator[conf.TCPF])},
 		time:    uint32(time.Now().UnixNano() / int64(time.Millisecond)),
-		ePool: sync.Pool{
-			New: func() any {
-				return &encoder{
-					eth: layers.Ethernet{SrcMAC: cfg.Interface.HardwareAddr},
-					mss: [2]byte{0x05, 0xb4},
-					ws:  [1]byte{8},
-					buf: gopacket.NewSerializeBuffer(),
-				}
-			},
-		},
+		bufs: sync.Pool{New: func() any {
+			b := make([]byte, 0, maxHdrLen+mtuLimit)
+			return &b
+		}},
+	}
+	tos := uint8(cfg.DSCP << 2)
+	var srcMAC []byte
+	if cfg.Interface != nil {
+		srcMAC = cfg.Interface.HardwareAddr
 	}
 	if cfg.IPv4.Addr != nil {
-		sh.srcIPv4 = cfg.IPv4.Addr.IP
-		sh.srcIPv4RHWA = cfg.IPv4.Router
+		sh.v4 = frameAddrs{srcMAC: srcMAC, dstMAC: cfg.IPv4.Router, srcIP: cfg.IPv4.Addr.IP.To4(), tos: tos}
 	}
 	if cfg.IPv6.Addr != nil {
-		sh.srcIPv6 = cfg.IPv6.Addr.IP
-		sh.srcIPv6RHWA = cfg.IPv6.Router
+		sh.v6 = frameAddrs{srcMAC: srcMAC, dstMAC: cfg.IPv6.Router, srcIP: cfg.IPv6.Addr.IP.To16(), tos: tos}
 	}
-	return sh, nil
+	return sh
 }
 
-func (h *SendHandle) buildIPv4Header(e *encoder, dstIP net.IP) {
-	e.ip4 = layers.IPv4{
-		Version:  4,
-		IHL:      5,
-		TOS:      h.tos,
-		TTL:      64,
-		Flags:    layers.IPv4DontFragment,
-		Protocol: layers.IPProtocolTCP,
-		SrcIP:    h.srcIPv4,
-		DstIP:    dstIP,
-	}
-}
+// mtuLimit is kcp-go's largest packet.
+const mtuLimit = 1500
 
-func (h *SendHandle) buildIPv6Header(e *encoder, dstIP net.IP) {
-	e.ip6 = layers.IPv6{
-		Version:      6,
-		TrafficClass: h.tos,
-		HopLimit:     64,
-		NextHeader:   layers.IPProtocolTCP,
-		SrcIP:        h.srcIPv6,
-		DstIP:        dstIP,
-	}
-}
-
-func (h *SendHandle) buildTCPHeader(e *encoder, dstPort uint16, f conf.TCPF) {
-	e.tcp = layers.TCP{
-		SrcPort: layers.TCPPort(h.srcPort),
-		DstPort: layers.TCPPort(dstPort),
-		FIN:     f.FIN, SYN: f.SYN, RST: f.RST, PSH: f.PSH, ACK: f.ACK, URG: f.URG, ECE: f.ECE, CWR: f.CWR, NS: f.NS,
-		Window: 65535,
-	}
-
+// segment fills the per-packet TCP fields. The sequence, ack and timestamp
+// values follow the pattern paqet has always sent.
+func (h *SendHandle) segment(dstPort uint16, f conf.TCPF) tcpSegment {
 	counter := h.tsCounter.Add(1)
 	tsVal := h.time + (counter >> 3)
-	opts := e.opts[:0]
+	s := tcpSegment{srcPort: h.srcPort, dstPort: dstPort, flags: f, tsVal: tsVal}
 	if f.SYN {
-		binary.BigEndian.PutUint32(e.ts[0:4], tsVal)
-		binary.BigEndian.PutUint32(e.ts[4:8], 0)
-		opts = append(opts,
-			layers.TCPOption{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: e.mss[:]},
-			layers.TCPOption{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
-			layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: e.ts[:]},
-			layers.TCPOption{OptionType: layers.TCPOptionKindNop},
-			layers.TCPOption{OptionType: layers.TCPOptionKindWindowScale, OptionLength: 3, OptionData: e.ws[:]},
-		)
-		e.tcp.Seq = 1 + (counter & 0x7)
-		e.tcp.Ack = 0
+		s.seq = 1 + (counter & 0x7)
 		if f.ACK {
-			e.tcp.Ack = e.tcp.Seq + 1
+			s.ack = s.seq + 1
 		}
 	} else {
-		tsEcr := tsVal - (counter%200 + 50)
-		binary.BigEndian.PutUint32(e.ts[0:4], tsVal)
-		binary.BigEndian.PutUint32(e.ts[4:8], tsEcr)
-		opts = append(opts,
-			layers.TCPOption{OptionType: layers.TCPOptionKindNop},
-			layers.TCPOption{OptionType: layers.TCPOptionKindNop},
-			layers.TCPOption{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: e.ts[:]},
-		)
+		s.tsEcr = tsVal - (counter%200 + 50)
 		seq := h.time + (counter << 7)
-		e.tcp.Seq = seq
-		e.tcp.Ack = seq - (counter & 0x3FF) + 1400
+		s.seq = seq
+		s.ack = seq - (counter & 0x3FF) + 1400
 	}
-	e.tcp.Options = opts
+	return s
 }
 
-func (h *SendHandle) Write(payload []byte, addr *net.UDPAddr) error {
-	e := h.ePool.Get().(*encoder)
-	defer func() {
-		e.buf.Clear()
-		h.ePool.Put(e)
-	}()
-
-	dstIP := addr.IP
-	dstPort := uint16(addr.Port)
-
-	h.buildTCPHeader(e, dstPort, h.getClientTCPF(dstIP, dstPort))
-
-	var ipLayer gopacket.SerializableLayer
-	if dstIP.To4() != nil {
-		h.buildIPv4Header(e, dstIP)
-		ipLayer = &e.ip4
-		e.tcp.SetNetworkLayerForChecksum(&e.ip4)
-		e.eth.DstMAC = h.srcIPv4RHWA
-		e.eth.EthernetType = layers.EthernetTypeIPv4
+// Write sends payload to dst in one frame.
+func (h *SendHandle) Write(payload []byte, dst *Addr) error {
+	var fa frameAddrs
+	if len(dst.IP) == 16 {
+		if h.v6.srcIP == nil {
+			return errNoIPv6
+		}
+		fa = h.v6
 	} else {
-		h.buildIPv6Header(e, dstIP)
-		ipLayer = &e.ip6
-		e.tcp.SetNetworkLayerForChecksum(&e.ip6)
-		e.eth.DstMAC = h.srcIPv6RHWA
-		e.eth.EthernetType = layers.EthernetTypeIPv6
+		if h.v4.srcIP == nil {
+			return errNoIPv4
+		}
+		fa = h.v4
 	}
+	fa.dstIP = dst.IP
 
-	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if err := gopacket.SerializeLayers(e.buf, opts, &e.eth, ipLayer, &e.tcp, gopacket.Payload(payload)); err != nil {
-		return err
-	}
+	dstPort := uint16(dst.Port)
+	seg := h.segment(dstPort, h.getClientTCPF(dst.IP, dstPort))
 
-	// pcap_sendpacket is not guaranteed thread-safe.
-	h.writeMu.Lock()
-	err := h.handle.WritePacketData(e.buf.Bytes())
-	h.writeMu.Unlock()
+	bp := h.bufs.Get().(*[]byte)
+	frame := encodeFrame(*bp, &fa, &seg, payload)
+	err := h.sink.write(frame)
+	*bp = frame[:0]
+	h.bufs.Put(bp)
 	return err
 }
 
@@ -213,7 +120,7 @@ func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
 }
 
 func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
-	a, ok := addr.(*net.UDPAddr)
+	a, ok := AddrOf(addr)
 	if !ok {
 		return
 	}
@@ -223,7 +130,7 @@ func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 }
 
 func (h *SendHandle) deleteClientTCPF(addr net.Addr) {
-	a, ok := addr.(*net.UDPAddr)
+	a, ok := AddrOf(addr)
 	if !ok {
 		return
 	}
@@ -233,7 +140,7 @@ func (h *SendHandle) deleteClientTCPF(addr net.Addr) {
 }
 
 func (h *SendHandle) Close() {
-	if h.handle != nil {
-		h.handle.Close()
+	if h.sink != nil {
+		h.sink.close()
 	}
 }
