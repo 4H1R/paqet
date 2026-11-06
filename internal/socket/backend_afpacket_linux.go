@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"golang.org/x/net/bpf"
@@ -281,12 +283,198 @@ func (r *ringRx) close() {
 	}
 }
 
+func newAFPacketTx(cfg *conf.Network) (txSink, error) {
+	t, err := newRingTx(cfg.Interface.Index)
+	if err == nil {
+		return t, nil
+	}
+	flog.Warnf("AF_PACKET transmit ring unavailable, sending one packet per system call: %v", err)
+	return newRawTx(cfg)
+}
+
+// ringTx sends through a PACKET_TX_RING. write copies the frame into the
+// shared ring and returns without a system call; a flusher goroutine then
+// asks the kernel to transmit everything queued with one send(), and the
+// kernel keeps picking up frames that are queued while it works. Under
+// load that turns one system call per packet into one per burst, which
+// was the single largest CPU cost of the transport.
+//
+// Transmit errors are reported by the next write, as they surface
+// asynchronously.
+type ringTx struct {
+	fd      int
+	ring    []byte
+	nframes int
+
+	mu     sync.Mutex
+	idx    int  // next slot to fill, guarded by mu
+	closed bool // guarded by mu
+
+	kick chan struct{}
+	done chan struct{}
+	wg   sync.WaitGroup
+	err  atomic.Pointer[error]
+}
+
+const (
+	txRingFrames = 1024 // 2MB; one KCP flush of the default windows fits
+	// txDataOff is where frame data starts in a TX slot: TPACKET2_HDRLEN
+	// minus the sockaddr_ll the kernel expects in front of it.
+	txDataOff  = 32
+	txMaxFrame = ringFrameSize - txDataOff
+)
+
+func newRingTx(ifindex int) (*ringTx, error) {
+	// Protocol 0: the socket only sends and never queues received frames.
+	// The kernel infers each frame's protocol from its Ethernet header.
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("socket: %w", err)
+	}
+	t := &ringTx{fd: fd, kick: make(chan struct{}, 1), done: make(chan struct{})}
+	fail := func(what string, err error) (*ringTx, error) {
+		if t.ring != nil {
+			_ = unix.Munmap(t.ring)
+		}
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_VERSION, unix.TPACKET_V2); err != nil {
+		return fail("PACKET_VERSION", err)
+	}
+	// Skip malformed frames instead of stopping the ring at them.
+	if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_LOSS, 1); err != nil {
+		return fail("PACKET_LOSS", err)
+	}
+	perBlock := ringBlockSize / ringFrameSize
+	blocks := (txRingFrames + perBlock - 1) / perBlock
+	req := unix.TpacketReq{
+		Block_size: ringBlockSize,
+		Block_nr:   uint32(blocks),
+		Frame_size: ringFrameSize,
+		Frame_nr:   uint32(blocks * perBlock),
+	}
+	if err := unix.SetsockoptTpacketReq(fd, unix.SOL_PACKET, unix.PACKET_TX_RING, &req); err != nil {
+		return fail("PACKET_TX_RING", err)
+	}
+	if t.ring, err = unix.Mmap(fd, 0, blocks*ringBlockSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED); err != nil {
+		return fail("mmap", err)
+	}
+	t.nframes = int(req.Frame_nr)
+	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Ifindex: ifindex}); err != nil {
+		return fail("bind", err)
+	}
+	t.wg.Add(1)
+	go t.flushLoop()
+	return t, nil
+}
+
+func (t *ringTx) slot(i int) *unix.Tpacket2Hdr {
+	return (*unix.Tpacket2Hdr)(unsafe.Pointer(&t.ring[i*ringFrameSize]))
+}
+
+var errFrameTooLarge = errors.New("socket: frame too large")
+
+func (t *ringTx) write(frame []byte) error {
+	if len(frame) > txMaxFrame {
+		return errFrameTooLarge
+	}
+	if p := t.err.Swap(nil); p != nil {
+		return *p
+	}
+
+	t.mu.Lock()
+	for {
+		if t.closed {
+			t.mu.Unlock()
+			return net.ErrClosed
+		}
+		if atomic.LoadUint32(&t.slot(t.idx).Status) == unix.TP_STATUS_AVAILABLE {
+			break
+		}
+		// Ring full: every slot is queued or in flight. Make sure the
+		// flusher runs and give the kernel time to free one.
+		t.mu.Unlock()
+		t.signal()
+		time.Sleep(50 * time.Microsecond)
+		t.mu.Lock()
+	}
+	i := t.idx
+	t.idx++
+	if t.idx == t.nframes {
+		t.idx = 0
+	}
+	hdr := t.slot(i)
+	base := i*ringFrameSize + txDataOff
+	copy(t.ring[base:base+len(frame)], frame)
+	hdr.Len = uint32(len(frame))
+	// Publish the frame: the store orders the copy before the kernel can
+	// see the request.
+	atomic.StoreUint32(&hdr.Status, unix.TP_STATUS_SEND_REQUEST)
+	t.mu.Unlock()
+
+	t.signal()
+	return nil
+}
+
+func (t *ringTx) signal() {
+	select {
+	case t.kick <- struct{}{}:
+	default: // a flush is already pending and will see this frame
+	}
+}
+
+func (t *ringTx) flushLoop() {
+	defer t.wg.Done()
+	for {
+		select {
+		case <-t.kick:
+		case <-t.done:
+			return
+		}
+		for {
+			// A blocking send with no buffer transmits every queued frame,
+			// including ones queued meanwhile, and returns once they have
+			// left the socket.
+			_, _, errno := unix.Syscall6(unix.SYS_SENDTO, uintptr(t.fd), 0, 0, 0, 0, 0)
+			if errno == unix.EINTR {
+				continue
+			}
+			if errno != 0 {
+				err := error(errno)
+				t.err.Store(&err)
+				if errno == unix.ENOBUFS || errno == unix.EAGAIN {
+					time.Sleep(100 * time.Microsecond)
+					continue
+				}
+			}
+			break
+		}
+	}
+}
+
+func (t *ringTx) close() {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	t.mu.Unlock()
+	close(t.done)
+	t.wg.Wait()
+	_ = unix.Munmap(t.ring)
+	_ = unix.Close(t.fd)
+}
+
+// rawTx sends one frame per system call. It is the fallback when the
+// transmit ring cannot be set up.
 type rawTx struct {
 	fd     int
 	v4, v6 unix.SockaddrLinklayer
 }
 
-func newAFPacketTx(cfg *conf.Network) (txSink, error) {
+func newRawTx(cfg *conf.Network) (txSink, error) {
 	// Protocol 0: the socket only sends and never queues received frames.
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
