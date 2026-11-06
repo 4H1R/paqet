@@ -8,11 +8,8 @@ import (
 	"paqet/internal/conf"
 )
 
-var (
-	// errTimeout means no frame arrived within the backend's poll interval.
-	errTimeout       = errors.New("socket: capture timeout")
-	errFrameTooLarge = errors.New("socket: frame too large")
-)
+// errTimeout means no frame arrived within the backend's poll interval.
+var errTimeout = errors.New("socket: capture timeout")
 
 type rxSource interface {
 	// next returns the next captured frame, valid until the following call

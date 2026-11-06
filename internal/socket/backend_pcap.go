@@ -101,8 +101,7 @@ type pcapTx struct {
 	mu sync.Mutex // pcap_sendpacket is not guaranteed thread-safe
 }
 
-// newPcapPacketTx sends one packet per pcap_sendpacket call.
-func newPcapPacketTx(cfg *conf.Network) (txSink, error) {
+func newPcapTx(cfg *conf.Network) (txSink, error) {
 	// The send handle captures nothing, so it needs only a small buffer.
 	handle, err := newHandle(cfg, 64*1024, 128, pcap.BlockForever)
 	if err != nil {
