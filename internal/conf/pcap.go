@@ -9,14 +9,9 @@ import (
 
 type PCAP struct {
 	Sockbuf int `yaml:"sockbuf"`
-	// Backend selects the packet capture implementation: "auto" (AF_PACKET
-	// on Linux, libpcap elsewhere), "afpacket" or "libpcap".
+	// Backend is "auto" (AF_PACKET on Linux, libpcap elsewhere),
+	// "afpacket" or "libpcap".
 	Backend string `yaml:"backend"`
-	// Readers is how many sockets receive packets on the server, each with
-	// its own goroutine and share of sockbuf (Linux AF_PACKET only).
-	// Clients are split between them by flow, so it can only help a
-	// server with several busy clients. Defaults to 1.
-	Readers int `yaml:"readers"`
 }
 
 func (p *PCAP) setDefaults(role string) {
@@ -29,9 +24,6 @@ func (p *PCAP) setDefaults(role string) {
 	}
 	if p.Backend == "" {
 		p.Backend = "auto"
-	}
-	if p.Readers == 0 {
-		p.Readers = 1
 	}
 }
 
@@ -56,10 +48,6 @@ func (p *PCAP) validate() []error {
 		errors = append(errors, fmt.Errorf("PCAP backend must be one of: %v", backends))
 	} else if p.Backend == "afpacket" && runtime.GOOS != "linux" {
 		errors = append(errors, fmt.Errorf("PCAP backend \"afpacket\" is only available on Linux"))
-	}
-
-	if p.Readers < 1 || p.Readers > 64 {
-		errors = append(errors, fmt.Errorf("PCAP readers must be between 1-64"))
 	}
 
 	return errors

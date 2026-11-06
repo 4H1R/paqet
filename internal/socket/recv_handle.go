@@ -9,61 +9,65 @@ import (
 
 var errNoPayload = errors.New("socket: packet carries no payload")
 
-// RecvHandle reads frames from one capture source and decodes them.
-//
-// Reads are zero-copy: a returned payload aliases the capture buffer and is
-// valid until the next read. mu is held from a read until the caller is
-// done with the payload, and the source is only closed by whoever next
-// holds mu after Close, so closing never frees memory a reader still uses.
-type RecvHandle struct {
+// skippable reports whether a read error only means "nothing usable yet".
+func skippable(err error) bool { return err == errTimeout || err == errNoPayload }
+
+// recvHandle decodes frames from a capture source. Payloads are not copied:
+// they alias the capture buffer, which close must not release while a
+// payload is in use.
+type recvHandle struct {
 	src  rxSource
 	port uint16
 
-	mu    sync.Mutex
-	addrs addrCache    // guarded by mu
-	frame decodedFrame // guarded by mu
+	mu     sync.Mutex // held while a payload is in use
+	addrs  addrCache
+	frame  decodedFrame
+	reaped bool
 
 	closed atomic.Bool
-	reaped bool // guarded by mu
 }
 
-func newRecvHandle(src rxSource, port int) *RecvHandle {
-	h := &RecvHandle{src: src, port: uint16(port), addrs: make(addrCache)}
+func newRecvHandle(src rxSource, port int) *recvHandle {
+	h := &recvHandle{src: src, port: uint16(port), addrs: make(addrCache)}
 	registerRx(h)
 	return h
 }
 
-// readLocked returns the next payload sent to the handle's port and its
-// source. The caller must hold mu until it is done with the payload.
-func (h *RecvHandle) readLocked() ([]byte, *Addr, error) {
-	if h.closed.Load() || h.reaped {
-		return nil, nil, net.ErrClosed
-	}
-	f, err := h.src.next()
-	if err != nil {
-		return nil, nil, err
-	}
-	d := &h.frame
-	// The capture filter already matched the port; checking again keeps
-	// stray frames out during setup and on backends without a filter.
-	if !decodeFrame(f, d) || d.dstPort != h.port || len(d.payload) == 0 {
-		return nil, nil, errNoPayload
-	}
-	return d.payload, h.addrs.get(d.srcIP, d.srcPort), nil
-}
-
-// unlock releases mu and finishes a Close that happened meanwhile.
-func (h *RecvHandle) unlock() {
+// read waits for the next payload sent to the handle's port and passes it
+// to use. The payload is only valid during the call. Errors for which
+// skippable is true mean the caller should simply read again.
+func (h *recvHandle) read(use func(payload []byte, from *Addr)) error {
+	h.mu.Lock()
+	err := h.readLocked(use)
 	h.mu.Unlock()
 	if h.closed.Load() {
 		h.reap()
 	}
+	return err
 }
 
-// reap closes the source if Close was called and no reader holds mu. If a
-// reader does, it reaps on unlock. Close stores closed before trying the
-// lock and readers load it after unlocking, so one of them always reaps.
-func (h *RecvHandle) reap() {
+func (h *recvHandle) readLocked(use func([]byte, *Addr)) error {
+	if h.reaped || h.closed.Load() {
+		return net.ErrClosed
+	}
+	f, err := h.src.next()
+	if err != nil {
+		return err
+	}
+	d := &h.frame
+	// The port is checked again because no filter covers the moment
+	// between opening a socket and attaching it.
+	if !decodeFrame(f, d) || d.dstPort != h.port || len(d.payload) == 0 {
+		return errNoPayload
+	}
+	use(d.payload, h.addrs.get(d.srcIP, d.srcPort))
+	return nil
+}
+
+// reap releases the source once closed and no reader holds mu. close stores
+// closed before trying the lock and read checks it after unlocking, so
+// whichever runs last reaps.
+func (h *recvHandle) reap() {
 	if !h.mu.TryLock() {
 		return
 	}
@@ -75,41 +79,39 @@ func (h *RecvHandle) reap() {
 	h.mu.Unlock()
 }
 
-// Close stops the handle. A blocked reader is woken; the capture source is
-// released once it returns.
-func (h *RecvHandle) Close() {
+func (h *recvHandle) close() {
 	h.closed.Store(true)
 	h.src.wake()
 	h.reap()
 }
 
-// Kernel drop accounting across all receive handles, for the stats line.
+// Kernel drop counters of all receive handles, for the stats line.
 var rxStats struct {
 	sync.Mutex
-	live        map[*RecvHandle]struct{}
+	live        map[*recvHandle]struct{}
 	closedDrops uint64
 }
 
-func registerRx(h *RecvHandle) {
+func registerRx(h *recvHandle) {
 	rxStats.Lock()
+	defer rxStats.Unlock()
 	if rxStats.live == nil {
-		rxStats.live = make(map[*RecvHandle]struct{})
+		rxStats.live = make(map[*recvHandle]struct{})
 	}
 	rxStats.live[h] = struct{}{}
-	rxStats.Unlock()
 }
 
-func unregisterRx(h *RecvHandle) {
+func unregisterRx(h *recvHandle) {
 	rxStats.Lock()
+	defer rxStats.Unlock()
 	if _, ok := rxStats.live[h]; ok {
 		delete(rxStats.live, h)
 		rxStats.closedDrops += h.src.drops()
 	}
-	rxStats.Unlock()
 }
 
-// Drops returns how many received frames the kernel dropped, across all
-// receive handles, because the capture buffer was full.
+// Drops returns how many received packets the kernel dropped because a
+// capture buffer was full.
 func Drops() uint64 {
 	rxStats.Lock()
 	defer rxStats.Unlock()

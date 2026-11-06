@@ -13,8 +13,7 @@ import (
 )
 
 func newHandle(cfg *conf.Network, sockbuf int, snapLen int, timeout time.Duration) (*pcap.Handle, error) {
-	// On Windows, use the GUID field to construct the NPF device name
-	// On other platforms, use the interface name directly
+	// Npcap names devices by GUID.
 	ifaceName := cfg.Interface.Name
 	if runtime.GOOS == "windows" {
 		ifaceName = cfg.GUID
@@ -29,9 +28,8 @@ func newHandle(cfg *conf.Network, sockbuf int, snapLen int, timeout time.Duratio
 	if err = inactive.SetBufferSize(sockbuf); err != nil {
 		return nil, fmt.Errorf("failed to set pcap buffer size to %d: %v", sockbuf, err)
 	}
-	// libpcap on Linux sizes every ring slot from the snap length when
-	// immediate mode is on, so a 64KB snap length leaves only ~64 slots in
-	// a 4MB buffer and bursts overflow it.
+	// In immediate mode libpcap on Linux sizes every ring slot from the snap
+	// length, so a large one leaves room for only a few dozen packets.
 	if err = inactive.SetSnapLen(snapLen); err != nil {
 		return nil, fmt.Errorf("failed to set pcap snap length: %v", err)
 	}
@@ -49,7 +47,6 @@ func newHandle(cfg *conf.Network, sockbuf int, snapLen int, timeout time.Duratio
 	if err != nil {
 		return nil, fmt.Errorf("failed to activate pcap handle on %s: %v", cfg.Interface.Name, err)
 	}
-
 	return handle, nil
 }
 
@@ -57,13 +54,13 @@ type pcapRx struct {
 	h *pcap.Handle
 }
 
-func newPcapRx(cfg *conf.Network) (*pcapRx, error) {
+func newPcapRx(cfg *conf.Network) (rxSource, error) {
 	handle, err := newHandle(cfg, cfg.PCAP.Sockbuf, captureSnapLen, 100*time.Millisecond)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pcap handle: %w", err)
 	}
 
-	// SetDirection is not fully supported on Windows Npcap, so skip it
+	// Npcap does not fully support SetDirection.
 	if runtime.GOOS != "windows" {
 		if err := handle.SetDirection(pcap.DirectionIn); err != nil {
 			handle.Close()
@@ -71,8 +68,7 @@ func newPcapRx(cfg *conf.Network) (*pcapRx, error) {
 		}
 	}
 
-	filter := fmt.Sprintf("tcp and dst port %d", cfg.Port)
-	if err := handle.SetBPFFilter(filter); err != nil {
+	if err := handle.SetBPFFilter(fmt.Sprintf("tcp and dst port %d", cfg.Port)); err != nil {
 		handle.Close()
 		return nil, fmt.Errorf("failed to set BPF filter: %w", err)
 	}
@@ -95,7 +91,7 @@ func (r *pcapRx) drops() uint64 {
 	return uint64(s.PacketsDropped)
 }
 
-// wake is a no-op: reads time out every 100ms on their own.
+// wake is a no-op: reads time out every 100ms anyway.
 func (r *pcapRx) wake() {}
 
 func (r *pcapRx) close() { r.h.Close() }
@@ -105,13 +101,13 @@ type pcapTx struct {
 	mu sync.Mutex // pcap_sendpacket is not guaranteed thread-safe
 }
 
-func newPcapTx(cfg *conf.Network) (*pcapTx, error) {
-	handle, err := newHandle(cfg, sendBufSize, 128, pcap.BlockForever)
+func newPcapTx(cfg *conf.Network) (txSink, error) {
+	// The send handle captures nothing, so it needs only a small buffer.
+	handle, err := newHandle(cfg, 64*1024, 128, pcap.BlockForever)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pcap handle: %w", err)
 	}
 
-	// SetDirection is not fully supported on Windows Npcap, so skip it
 	if runtime.GOOS != "windows" {
 		if err := handle.SetDirection(pcap.DirectionOut); err != nil {
 			handle.Close()
@@ -128,9 +124,8 @@ func newPcapTx(cfg *conf.Network) (*pcapTx, error) {
 
 func (t *pcapTx) write(frame []byte) error {
 	t.mu.Lock()
-	err := t.h.WritePacketData(frame)
-	t.mu.Unlock()
-	return err
+	defer t.mu.Unlock()
+	return t.h.WritePacketData(frame)
 }
 
 func (t *pcapTx) close() { t.h.Close() }

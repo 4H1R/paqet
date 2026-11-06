@@ -51,8 +51,9 @@ func TestCopyTUsesWriterTo(t *testing.T) {
 }
 
 func TestCopyTSkipsOSConnWriterTo(t *testing.T) {
-	if !isOSConn(&net.TCPConn{}) {
-		t.Fatal("*net.TCPConn must use the pooled buffer path")
+	var r io.Reader = &net.TCPConn{}
+	if _, ok := r.(socket); !ok {
+		t.Fatal("*net.TCPConn must use the pooled, idle-aware path")
 	}
 }
 

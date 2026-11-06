@@ -7,12 +7,10 @@ import (
 	"paqet/internal/conf"
 )
 
-// Hand-rolled frame encoding and decoding for the packet hot path. paqet
-// only ever builds Ethernet + IPv4/IPv6 + TCP frames with one of two fixed
-// TCP option layouts, and only ever needs the source address and payload of
-// a received frame, so a general purpose packet library is pure overhead
-// here. The encoder output is byte-for-byte identical to the gopacket based
-// encoder it replaces (see wire_test.go).
+// Frame encoding and decoding for the hot path. paqet only builds Ethernet
+// + IPv4/IPv6 + TCP frames with two fixed option layouts, so a general
+// packet library is pure overhead. wire_test.go checks the output stays
+// byte-for-byte identical to the gopacket encoder this replaced.
 
 const (
 	ethHdrLen    = 14
@@ -21,7 +19,6 @@ const (
 	tcpHdrLenSYN = 40 // 20 + MSS(4) SACKPermitted(2) TS(10) NOP(1) WS(3)
 	tcpHdrLen    = 32 // 20 + NOP NOP TS(10)
 
-	// maxHdrLen bounds every header stack the encoder produces.
 	maxHdrLen = ethHdrLen + ipv6HdrLen + tcpHdrLenSYN
 
 	etherTypeIPv4 = 0x0800
@@ -32,7 +29,6 @@ const (
 	protoTCP = 6
 )
 
-// tcpSegment holds the per-packet TCP fields.
 type tcpSegment struct {
 	srcPort, dstPort uint16
 	seq, ack         uint32
@@ -40,16 +36,15 @@ type tcpSegment struct {
 	flags            conf.TCPF
 }
 
-// frameAddrs holds the link and network addresses of a frame. srcIP and
-// dstIP are both 4 bytes (IPv4) or both 16 bytes (IPv6).
+// frameAddrs holds a frame's addresses. srcIP and dstIP are both 4 bytes
+// (IPv4) or both 16 bytes (IPv6).
 type frameAddrs struct {
 	srcMAC, dstMAC []byte
 	srcIP, dstIP   []byte
 	tos            uint8
 }
 
-// encodeFrame writes an Ethernet/IP/TCP frame carrying payload into buf,
-// growing it if needed, and returns the frame.
+// encodeFrame builds the frame in buf, growing it if needed.
 func encodeFrame(buf []byte, a *frameAddrs, t *tcpSegment, payload []byte) []byte {
 	v6 := len(a.dstIP) == 16
 	ipLen := ipv4HdrLen
@@ -66,8 +61,7 @@ func encodeFrame(buf []byte, a *frameAddrs, t *tcpSegment, payload []byte) []byt
 	}
 	b := buf[:total]
 
-	// Ethernet. The frame is always longer than the 60 byte minimum, so no
-	// padding is ever needed.
+	// Frames always exceed Ethernet's 60 byte minimum; no padding needed.
 	copy(b[0:6], a.dstMAC)
 	copy(b[6:12], a.srcMAC)
 
@@ -165,8 +159,8 @@ func tcpFlagByte(f conf.TCPF) byte {
 	return v
 }
 
-// sum16 adds b, read as big-endian 16-bit words, to the ones' complement
-// accumulator init. It works 32 bytes at a time with 64-bit carries.
+// sum16 adds b's big-endian 16-bit words to a ones' complement sum, 32 bytes
+// at a time.
 func sum16(init uint32, b []byte) uint32 {
 	s := uint64(init)
 	var c uint64
@@ -197,7 +191,6 @@ func sum16(init uint32, b []byte) uint32 {
 	return uint32(s)
 }
 
-// fold reduces a ones' complement accumulator to a 16-bit checksum.
 func fold(s uint32) uint16 {
 	for s>>16 != 0 {
 		s = s&0xffff + s>>16
@@ -205,7 +198,6 @@ func fold(s uint32) uint16 {
 	return ^uint16(s)
 }
 
-// decodedFrame is the part of a received frame paqet uses.
 type decodedFrame struct {
 	srcIP   []byte // 4 or 16 bytes, aliases the frame
 	srcPort uint16
@@ -213,9 +205,8 @@ type decodedFrame struct {
 	payload []byte // aliases the frame
 }
 
-// decodeFrame parses an Ethernet frame carrying TCP over IPv4 or IPv6.
-// VLAN tags are skipped. Fragments, IPv6 extension headers and anything
-// that is not TCP are rejected. The returned slices alias f.
+// decodeFrame parses TCP over IPv4/IPv6 over Ethernet, skipping VLAN tags.
+// It rejects fragments and IPv6 extension headers. Slices in d alias f.
 func decodeFrame(f []byte, d *decodedFrame) bool {
 	if len(f) < ethHdrLen {
 		return false

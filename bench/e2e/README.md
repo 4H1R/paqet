@@ -23,10 +23,9 @@ bash bench/e2e/run_all.sh          # builds master and HEAD, ~45 minutes
 python3 bench/e2e/report.py --lan $PQBENCH_DIR/results-lan-single-*.jsonl ...
 ```
 
-Variants: `old` is the baseline build. The candidate runs as `new-libpcap`
-(`pcap.backend: libpcap`), `new-afpacket-1r` (AF_PACKET, one reader) and `new`
-(defaults when measured: AF_PACKET with `pcap.readers` = 4. The default was then
-changed to 1, which is the `new-afpacket-1r` row).
+Variants: `old` is the baseline build; `new` is the candidate with its
+defaults (AF_PACKET on Linux) and `new-libpcap` the candidate with
+`pcap.backend: libpcap`.
 
 ## Results
 
@@ -42,8 +41,7 @@ candidate `25c76be`.
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 554 | 10.05 | 7.78 | 34 MB | 42 MB | 0.0 |
 | new, libpcap backend | 550 (-1%) | 9.65 (-4%) | 7.48 (-4%) | 33 MB (-2%) | 41 MB (-2%) | 0.0 |
-| new, AF_PACKET, 1 reader | 554 (+0%) | 8.18 (-19%) | 5.89 (-24%) | 30 MB (-12%) | 35 MB (-17%) | 0.0 |
-| new, AF_PACKET, 4 readers | 554 (-0%) | 8.19 (-18%) | 5.96 (-23%) | 30 MB (-11%) | 35 MB (-17%) | 0.0 |
+| new | 554 (+0%) | 8.18 (-19%) | 5.89 (-24%) | 30 MB (-12%) | 35 MB (-17%) | 0.0 |
 
 **Download (server → client)** — median of 3 runs
 
@@ -51,8 +49,7 @@ candidate `25c76be`.
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 542 | 7.50 | 9.36 | 36 MB | 46 MB | 14.9 |
 | new, libpcap backend | 530 (-2%) | 7.48 (-0%) | 9.33 (-0%) | 33 MB (-8%) | 45 MB (-3%) | 0.0 |
-| new, AF_PACKET, 1 reader | 513 (-5%) | 5.77 (-23%) | 7.69 (-18%) | 30 MB (-16%) | 39 MB (-14%) | 0.0 |
-| new, AF_PACKET, 4 readers | 547 (+1%) | 6.20 (-17%) | 7.93 (-15%) | 31 MB (-14%) | 39 MB (-15%) | 0.0 |
+| new | 513 (-5%) | 5.77 (-23%) | 7.69 (-18%) | 30 MB (-16%) | 39 MB (-14%) | 0.0 |
 
 ### WAN (40 ms RTT, 0.1% loss each way), 1 connection, 1 stream
 
@@ -62,8 +59,7 @@ candidate `25c76be`.
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 28 | 12.00 | 10.70 | 27 MB | 36 MB | 2.2 |
 | new, libpcap backend | 28 (+0%) | 12.03 (+0%) | 10.49 (-2%) | 25 MB (-8%) | 35 MB (-3%) | 2.7 |
-| new, AF_PACKET, 1 reader | 28 (+1%) | 11.37 (-5%) | 10.82 (+1%) | 23 MB (-16%) | 29 MB (-20%) | 2.2 |
-| new, AF_PACKET, 4 readers | 28 (-1%) | 11.47 (-4%) | 10.90 (+2%) | 23 MB (-16%) | 29 MB (-20%) | 2.2 |
+| new | 28 (+1%) | 11.37 (-5%) | 10.82 (+1%) | 23 MB (-16%) | 29 MB (-20%) | 2.2 |
 
 **Download (server → client)** — median of 3 runs
 
@@ -71,8 +67,7 @@ candidate `25c76be`.
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 93 | 5.58 | 7.78 | 35 MB | 43 MB | 93.0 |
 | new, libpcap backend | 96 (+4%) | 5.60 (+0%) | 7.45 (-4%) | 33 MB (-4%) | 40 MB (-7%) | 25.8 |
-| new, AF_PACKET, 1 reader | 94 (+2%) | 5.78 (+3%) | 6.97 (-10%) | 30 MB (-13%) | 34 MB (-21%) | 38.8 |
-| new, AF_PACKET, 4 readers | 97 (+4%) | 5.62 (+1%) | 6.70 (-14%) | 31 MB (-12%) | 34 MB (-20%) | 25.3 |
+| new | 94 (+2%) | 5.78 (+3%) | 6.97 (-10%) | 30 MB (-13%) | 34 MB (-21%) | 38.8 |
 
 ### LAN, transport.conn 4, 8 parallel streams
 
@@ -82,8 +77,7 @@ candidate `25c76be`.
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 2012 | 9.34 | 5.53 | 66 MB | 46 MB | 1140.2 |
 | new, libpcap backend | 3743 (+86%) | 8.74 (-6%) | 4.79 (-13%) | 64 MB (-3%) | 43 MB (-6%) | 0.0 |
-| new, AF_PACKET, 1 reader | 3986 (+98%) | 7.65 (-18%) | 4.46 (-19%) | 52 MB (-21%) | 38 MB (-18%) | 0.0 |
-| new, AF_PACKET, 4 readers | 3866 (+92%) | 7.78 (-17%) | 4.92 (-11%) | 52 MB (-21%) | 37 MB (-19%) | 0.0 |
+| new | 3986 (+98%) | 7.65 (-18%) | 4.46 (-19%) | 52 MB (-21%) | 38 MB (-18%) | 0.0 |
 
 **Download (server → client)** — median of 3 runs
 
@@ -91,8 +85,7 @@ candidate `25c76be`.
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 852 | 12.08 | 18.33 | 62 MB | 63 MB | 0.0 |
 | new, libpcap backend | 912 (+7%) | 11.25 (-7%) | 17.62 (-4%) | 60 MB (-4%) | 62 MB (-3%) | 0.0 |
-| new, AF_PACKET, 1 reader | 1517 (+78%) | 8.21 (-32%) | 10.97 (-40%) | 47 MB (-24%) | 55 MB (-13%) | 0.0 |
-| new, AF_PACKET, 4 readers | 1342 (+58%) | 9.10 (-25%) | 12.18 (-34%) | 48 MB (-23%) | 55 MB (-13%) | 0.0 |
+| new | 1517 (+78%) | 8.21 (-32%) | 10.97 (-40%) | 47 MB (-24%) | 55 MB (-13%) | 0.0 |
 
 ### LAN, 1 connection, raw-table DROP firewall rule instead of README rules
 
@@ -101,21 +94,21 @@ candidate `25c76be`.
 | build | Mbit/s | client CPU s/GB | server CPU s/GB | client peak RSS | server peak RSS | KCP retrans/s (sender) |
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 544 | 6.99 | 5.30 | 34 MB | 42 MB | 0.0 |
-| new, AF_PACKET, 4 readers | 520 (-5%) | 6.13 (-12%) | 4.12 (-22%) | 30 MB (-10%) | 35 MB (-16%) | 0.0 |
+| new\* | 520 (-5%) | 6.13 (-12%) | 4.12 (-22%) | 30 MB (-10%) | 35 MB (-16%) | 0.0 |
 
 **Download (server → client)** — median of 2 runs
 
 | build | Mbit/s | client CPU s/GB | server CPU s/GB | client peak RSS | server peak RSS | KCP retrans/s (sender) |
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 549 | 5.25 | 6.70 | 35 MB | 46 MB | 56.8 |
-| new, AF_PACKET, 4 readers | 554 (+1%) | 3.69 (-30%) | 5.46 (-19%) | 30 MB (-15%) | 39 MB (-14%) | 0.0 |
+| new\* | 554 (+1%) | 3.69 (-30%) | 5.46 (-19%) | 30 MB (-15%) | 39 MB (-14%) | 0.0 |
 
 ### 2,000 idle connections (each did one 32 KB echo round trip)
 
 | build | client RSS @30s | server RSS @30s | client RSS @300s | server RSS @300s | client live heap | server live heap |
 |---|---:|---:|---:|---:|---:|---:|
 | old (master) | 134 MB | 151 MB | 134 MB | 151 MB | 71 MB | 71 MB |
-| new, AF_PACKET, 4 readers | 120 MB | 135 MB | 96 MB | 104 MB | 7 MB | 7 MB |
+| new\* | 120 MB | 135 MB | 96 MB | 104 MB | 7 MB | 7 MB |
 
 "Live heap" is the Go heap after the last garbage collection, from
 `GODEBUG=gctrace=1`. The old build keeps a 32 KB copy buffer referenced by
@@ -148,8 +141,10 @@ collected every 2 minutes, which is why RSS only drops by the 300 s mark).
   (the peer's input path runs in the sender's context), so absolute CPU
   numbers are higher than on real NICs. The relative differences between
   builds are what matter.
-- **Server fanout (`pcap.readers`) did not help** with a single client
-  process and cost some CPU, so it defaults to 1. It is meant for servers
-  with many busy clients, which this testbed does not model.
+- **Server fanout was tried and removed.** Splitting server receive over
+  several AF_PACKET sockets (PACKET_FANOUT) never beat a single reader here
+  and cost some CPU. \*The raw-DROP and idle rows were measured with that
+  4-reader build, before it was removed; in every other table the single
+  reader was as fast or faster.
 - WAN results are noisy at 3 runs; the CPU differences there are within
   noise, but the retransmit reduction is consistent.

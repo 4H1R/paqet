@@ -193,9 +193,7 @@ VARIANTS = {
     "new-pprof": ("paqet-new-pprof", None),
     "old": ("paqet-old", None),
     "new-libpcap": ("paqet-new", {"backend": "libpcap"}),
-    "new-afpacket-1r": ("paqet-new", {"backend": "afpacket", "readers": 1}),
     "new": ("paqet-new", None),  # candidate defaults
-    "new-afpacket-4r": ("paqet-new", {"backend": "afpacket", "readers": 4}),
 }
 
 

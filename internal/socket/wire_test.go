@@ -116,7 +116,7 @@ func TestEncodeReusesBuffer(t *testing.T) {
 func TestSendHandleSegmentPattern(t *testing.T) {
 	// The sequence/ack/timestamp pattern is part of the wire fingerprint
 	// and must not change.
-	h := &SendHandle{srcPort: 1, time: 1_000_000}
+	h := &sendHandle{srcPort: 1, time: 1_000_000}
 	for i := uint32(1); i < 2000; i++ {
 		f := conf.TCPF{PSH: true, ACK: true}
 		if i%7 == 0 {

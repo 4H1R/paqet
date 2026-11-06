@@ -39,7 +39,6 @@ network:
   # pcap:
     # sockbuf: 8388608                         # 8MB buffer (default for server)
     # backend: "auto"                          # auto (AF_PACKET on Linux, libpcap elsewhere), afpacket, libpcap
-    # readers: 1                               # Linux, experimental: receive sockets splitting clients by flow
 
 # Transport protocol configuration
 transport:

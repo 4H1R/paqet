@@ -13,20 +13,20 @@ import (
 	"paqet/internal/conf"
 )
 
-// fakeRx is an rxSource fed from a channel. Its frame buffer is zeroed on
-// close, so a payload used after close shows up as corrupted data.
+// fakeRx is an rxSource fed from a channel. It zeroes its frame buffer on
+// close, so a payload used after close shows up as corrupted.
 type fakeRx struct {
-	frames   chan []byte
-	wakeCh   chan struct{}
-	buf      []byte
-	closed   atomic.Bool
-	inNext   atomic.Bool
-	dropped  atomic.Uint64
-	closeErr chan struct{}
+	frames  chan []byte
+	wakeCh  chan struct{}
+	buf     []byte
+	closed  atomic.Bool
+	inNext  atomic.Bool
+	dropped atomic.Uint64
+	done    chan struct{}
 }
 
 func newFakeRx() *fakeRx {
-	return &fakeRx{frames: make(chan []byte, 64), wakeCh: make(chan struct{}, 1), buf: make([]byte, 2048), closeErr: make(chan struct{})}
+	return &fakeRx{frames: make(chan []byte, 64), wakeCh: make(chan struct{}, 1), buf: make([]byte, 2048), done: make(chan struct{})}
 }
 
 func (r *fakeRx) next() ([]byte, error) {
@@ -37,8 +37,7 @@ func (r *fakeRx) next() ([]byte, error) {
 	defer r.inNext.Store(false)
 	select {
 	case f := <-r.frames:
-		n := copy(r.buf, f)
-		return r.buf[:n], nil
+		return r.buf[:copy(r.buf, f)], nil
 	case <-r.wakeCh:
 		return nil, errTimeout
 	case <-time.After(20 * time.Millisecond):
@@ -47,6 +46,7 @@ func (r *fakeRx) next() ([]byte, error) {
 }
 
 func (r *fakeRx) drops() uint64 { return r.dropped.Load() }
+
 func (r *fakeRx) wake() {
 	select {
 	case r.wakeCh <- struct{}{}:
@@ -62,7 +62,7 @@ func (r *fakeRx) close() {
 		panic("double close")
 	}
 	clear(r.buf)
-	close(r.closeErr)
+	close(r.done)
 }
 
 type fakeTx struct {
@@ -73,23 +73,30 @@ type fakeTx struct {
 
 func (t *fakeTx) write(f []byte) error {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.frames = append(t.frames, bytes.Clone(f))
-	t.mu.Unlock()
 	return nil
 }
-func (t *fakeTx) close() { t.mu.Lock(); t.closed = true; t.mu.Unlock() }
 
-func testConn(t *testing.T, port int) (*PacketConn, *fakeRx, *fakeTx) {
-	t.Helper()
+func (t *fakeTx) close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+}
+
+func testNetConf(port int) *conf.Network {
 	cfg := &conf.Network{Port: port}
 	cfg.IPv4.Addr = &net.UDPAddr{IP: testV4.srcIP, Port: port}
 	cfg.IPv4.Router = testDstMAC
 	cfg.TCP.LF = []conf.TCPF{{PSH: true, ACK: true}}
+	return cfg
+}
+
+func testConn(t *testing.T, port int) (*PacketConn, *fakeRx, *fakeTx) {
+	t.Helper()
 	rx, tx := newFakeRx(), &fakeTx{}
-	send := &sharedSend{h: newSendHandle(cfg, tx)}
-	send.refs.Store(1)
-	c := &PacketConn{cfg: cfg, send: send, recv: newRecvHandle(rx, port)}
-	return c, rx, tx
+	cfg := testNetConf(port)
+	return &PacketConn{send: newSendHandle(cfg, tx), recv: newRecvHandle(rx, port)}, rx, tx
 }
 
 func inbound(srcPort, dstPort uint16, payload string) []byte {
@@ -111,7 +118,7 @@ func TestReadFromAndWriteTo(t *testing.T) {
 		t.Fatalf("ReadFrom = %q, %v, %v", buf[:n], addr, err)
 	}
 
-	// Replying to the returned address and to a *net.UDPAddr both work.
+	// Replies work both to the returned address and to a *net.UDPAddr.
 	if _, err := c.WriteTo([]byte("reply"), addr); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +177,7 @@ func TestPusherDeliversAndStops(t *testing.T) {
 	rx.frames <- inbound(4000, 9999, "late")
 	select {
 	case g := <-got:
-		t.Fatalf("pushed after receiver was removed: %q", g)
+		t.Fatalf("pushed after the receiver was removed: %q", g)
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -191,9 +198,9 @@ func TestPusherDeliversAndStops(t *testing.T) {
 }
 
 func TestCloseWhileReceiving(t *testing.T) {
-	// Closing while the callback still uses the payload must not release
-	// the capture buffer under it.
-	c, rx, _ := testConn(t, 9999)
+	// Closing while the receiver still uses a payload must not release the
+	// capture buffer under it.
+	c, rx, tx := testConn(t, 9999)
 	inCallback := make(chan struct{})
 	release := make(chan struct{})
 	errs := make(chan error, 1)
@@ -217,7 +224,7 @@ func TestCloseWhileReceiving(t *testing.T) {
 	}
 	close(release)
 	select {
-	case <-rx.closeErr:
+	case <-rx.done:
 	case <-time.After(time.Second):
 		t.Fatal("source never closed")
 	}
@@ -232,6 +239,9 @@ func TestCloseWhileReceiving(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("receiver not told about the close")
 	}
+	if !tx.closed {
+		t.Fatal("send side not closed")
+	}
 }
 
 func TestCloseIdle(t *testing.T) {
@@ -240,23 +250,6 @@ func TestCloseIdle(t *testing.T) {
 	c.Close()
 	if !rx.closed.Load() || !tx.closed {
 		t.Fatal("idle conn did not release its handles")
-	}
-}
-
-func TestSharedSendClosedLast(t *testing.T) {
-	tx := &fakeTx{}
-	cfg := &conf.Network{Port: 1}
-	send := &sharedSend{h: newSendHandle(cfg, tx)}
-	send.refs.Store(2)
-	a := &PacketConn{send: send, recv: newRecvHandle(newFakeRx(), 1)}
-	b := &PacketConn{send: send, recv: newRecvHandle(newFakeRx(), 1)}
-	a.Close()
-	if tx.closed {
-		t.Fatal("shared send handle closed while still in use")
-	}
-	b.Close()
-	if !tx.closed {
-		t.Fatal("shared send handle not closed")
 	}
 }
 
@@ -274,17 +267,13 @@ func TestDropsAccounting(t *testing.T) {
 }
 
 func BenchmarkSendHandleWrite(b *testing.B) {
-	cfg := &conf.Network{Port: 9999}
-	cfg.IPv4.Addr = &net.UDPAddr{IP: testV4.srcIP, Port: 9999}
-	cfg.IPv4.Router = testDstMAC
-	cfg.TCP.LF = []conf.TCPF{{PSH: true, ACK: true}}
-	h := newSendHandle(cfg, discardTx{})
+	h := newSendHandle(testNetConf(9999), discardTx{})
 	dst := NewAddr(testV4.dstIP, 4000)
 	payload := make([]byte, 1350)
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for range b.N {
-		h.Write(payload, dst)
+		h.write(payload, dst)
 	}
 }
 

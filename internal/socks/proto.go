@@ -114,9 +114,8 @@ func (d *datagram) bytes() []byte {
 	return append(buf, d.data...)
 }
 
-// decodeDatagram parses a SOCKS5 UDP request header. key is the raw
-// address part (ATYP through PORT), usable as an allocation-free map key.
-// All returned slices alias p.
+// decodeDatagram parses a SOCKS5 UDP request. key is the raw ATYP..PORT
+// bytes, for allocation-free map lookups. All slices alias p.
 func decodeDatagram(p []byte) (d datagram, key []byte, err error) {
 	if len(p) < 4 || p[2] != 0 {
 		return d, nil, errProtocol

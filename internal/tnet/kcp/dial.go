@@ -19,8 +19,6 @@ func Dial(addr *net.UDPAddr, cfg *conf.KCP, netCfg conf.Network) (tnet.Conn, err
 		return nil, fmt.Errorf("kcp: failed to create packetconn: %w", err)
 	}
 
-	// The cached-string address lets kcp-go match each received packet's
-	// source with a string compare instead of formatting addresses.
 	conn, err := dialOn(socket.NewAddr(addr.IP, addr.Port), cfg, packetConn)
 	if err != nil {
 		packetConn.Close()

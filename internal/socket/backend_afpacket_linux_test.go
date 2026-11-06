@@ -12,8 +12,9 @@ import (
 	"paqet/internal/conf"
 )
 
-// TestAFPacketLoopback sends frames through the TX ring and receives them
-// through RX rings on the loopback interface. It needs CAP_NET_RAW.
+// TestAFPacketLoopback sends frames through the transmit ring (and the
+// per-packet fallback) and receives them through the receive ring on the
+// loopback interface. It needs CAP_NET_RAW.
 func TestAFPacketLoopback(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root for AF_PACKET")
@@ -22,102 +23,68 @@ func TestAFPacketLoopback(t *testing.T) {
 	if err != nil {
 		t.Skip("no loopback interface")
 	}
-	for _, readers := range []int{1, 3} {
-		t.Run(fmt.Sprintf("readers=%d", readers), func(t *testing.T) {
-			port := 40000 + readers
+	for i, name := range []string{"ring", "raw"} {
+		t.Run(name, func(t *testing.T) {
+			port := 40000 + i
 			cfg := &conf.Network{Interface: lo, Port: port}
-			cfg.PCAP.Sockbuf = 16 << 20 // holds the whole burst; the test reads after sending
+			cfg.PCAP.Sockbuf = 16 << 20 // holds the whole burst; reading starts after sending
 			cfg.PCAP.Backend = backendAFPacket
 
-			srcs, err := newRx(cfg, readers)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(srcs) != readers {
-				t.Fatalf("got %d readers, want %d", len(srcs), readers)
-			}
-			tx, err := newTx(cfg)
+			rx, tx, err := openBackend(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if _, ok := tx.(*ringTx); !ok {
 				t.Fatalf("expected the TX ring, got %T", tx)
 			}
+			if name == "raw" {
+				tx.close()
+				if tx, err = newRawTx(lo.Index); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h := newRecvHandle(rx, port)
+			defer h.close()
+			defer tx.close()
 
-			// Many flows (source ports), so fanout spreads them; each flow
-			// must land on exactly one reader, in order.
-			const flows, perFlow = 16, 50
+			const flows, perFlow = 8, 100
 			a := frameAddrs{srcMAC: make([]byte, 6), dstMAC: make([]byte, 6), srcIP: net.IPv4(127, 0, 0, 1).To4(), dstIP: net.IPv4(127, 0, 0, 1).To4()}
+			send := func(sport, dport uint16, payload string) {
+				s := tcpSegment{srcPort: sport, dstPort: dport, flags: conf.TCPF{PSH: true, ACK: true}}
+				if err := tx.write(encodeFrame(nil, &a, &s, []byte(payload))); err != nil {
+					t.Fatal(err)
+				}
+			}
 			for i := range perFlow {
 				for f := range flows {
-					s := tcpSegment{srcPort: uint16(20000 + f), dstPort: uint16(port), flags: conf.TCPF{PSH: true, ACK: true}}
-					if err := tx.write(encodeFrame(nil, &a, &s, []byte(fmt.Sprintf("%d:%d", f, i)))); err != nil {
-						t.Fatal(err)
-					}
+					send(uint16(20000+f), uint16(port), fmt.Sprintf("%d:%d", f, i))
 				}
-				// A different port must be filtered out.
-				s := tcpSegment{srcPort: 1, dstPort: uint16(port + 1000), flags: conf.TCPF{PSH: true, ACK: true}}
-				tx.write(encodeFrame(nil, &a, &s, []byte("other")))
+				send(1, uint16(port+1000), "other port") // must be filtered out
 			}
 
-			type got struct{ reader, seq int }
-			seen := map[int][]got{}
+			next := map[int]int{}
 			total := 0
 			deadline := time.Now().Add(5 * time.Second)
 			for total < flows*perFlow && time.Now().Before(deadline) {
-				for ri, src := range srcs {
-					h := newRecvHandle(src, port)
-					for {
-						h.mu.Lock()
-						p, addr, err := h.readLocked()
-						var f, i int
-						if err == nil {
-							fmt.Sscanf(string(p), "%d:%d", &f, &i)
-						}
-						h.mu.Unlock()
-						if err == errTimeout {
-							break
-						}
-						if err == errNoPayload {
-							continue
-						}
-						if err != nil {
-							t.Fatal(err)
-						}
-						if string(p) == "other" || addr.Port != 20000+f {
-							t.Fatalf("unexpected frame %q from %v", p, addr)
-						}
-						seen[f] = append(seen[f], got{ri, i})
-						total++
-						if total == flows*perFlow {
-							break
-						}
+				err := h.read(func(p []byte, from *Addr) {
+					var f, i int
+					fmt.Sscanf(string(p), "%d:%d", &f, &i)
+					if from.Port != 20000+f || i != next[f] {
+						t.Fatalf("frame %q from %v out of order (want seq %d)", p, from, next[f])
 					}
-					unregisterRx(h)
+					next[f]++
+					total++
+				})
+				if err != nil && !skippable(err) {
+					t.Fatal(err)
 				}
 			}
 			if total != flows*perFlow {
 				t.Fatalf("received %d of %d frames", total, flows*perFlow)
 			}
-			used := map[int]bool{}
-			for f, gs := range seen {
-				for i, g := range gs {
-					if g.seq != i || g.reader != gs[0].reader {
-						t.Fatalf("flow %d: frame %d arrived as seq %d on reader %d (first on %d)", f, i, g.seq, g.reader, gs[0].reader)
-					}
-				}
-				used[gs[0].reader] = true
+			if d := rx.drops(); d != 0 {
+				t.Errorf("kernel dropped %d frames", d)
 			}
-			if readers > 1 && len(used) < 2 {
-				t.Errorf("fanout sent all %d flows to one reader", flows)
-			}
-			for _, s := range srcs {
-				if d := s.drops(); d != 0 {
-					t.Errorf("kernel dropped %d frames", d)
-				}
-				s.close()
-			}
-			tx.close()
 		})
 	}
 }

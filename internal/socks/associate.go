@@ -12,8 +12,7 @@ import (
 	"paqet/internal/tnet"
 )
 
-// associate is one UDP ASSOCIATE session: a relay socket serving a single
-// client address, with one tunnel stream per destination.
+// associate is one UDP ASSOCIATE session with one stream per destination.
 type associate struct {
 	conn  *net.UDPConn
 	cIP   netip.Addr // expected client IP, unmapped
@@ -24,9 +23,8 @@ type associate struct {
 	dests map[string]*udpDest // keyed by the raw SOCKS address (ATYP..PORT)
 }
 
-// udpDest queues datagrams for one destination. A pump goroutine opens the
-// stream and writes to it, so a slow stream setup for one destination
-// never stalls datagrams to the others.
+// udpDest queues datagrams for one destination. Its own goroutine opens the
+// stream, so a slow setup never stalls the other destinations.
 type udpDest struct {
 	ch   chan *[]byte // pooled buffers, see buffer.GetUDP
 	done chan struct{}
@@ -35,8 +33,7 @@ type udpDest struct {
 
 func (d *udpDest) stop() { d.once.Do(func() { close(d.done) }) }
 
-// udpQueueLen bounds the datagrams queued per destination while its stream
-// is opening or busy. UDP is lossy, so excess datagrams are dropped.
+// udpQueueLen bounds datagrams queued per destination; extras are dropped.
 const udpQueueLen = 64
 
 func (a *associate) accept(src netip.AddrPort) bool {
@@ -121,9 +118,7 @@ func (s *Server) serveUDP(ctx context.Context, a *associate) {
 	}
 }
 
-// udpToStrm queues one datagram for its destination. The common case, an
-// existing destination, does a map lookup and a buffer copy and allocates
-// nothing.
+// udpToStrm queues a datagram. For a known destination it allocates nothing.
 func (s *Server) udpToStrm(ctx context.Context, a *associate, d datagram, key []byte) {
 	if len(d.data) > buffer.UDPSize {
 		flog.Debugf("SOCKS5 UDP %s -> %s: payload too large, %d bytes", a.cStr, d.address(), len(d.data))
@@ -150,8 +145,7 @@ func (s *Server) udpToStrm(ctx context.Context, a *associate, d datagram, key []
 	}
 }
 
-// pumpUDP opens the stream for one destination and writes its queued
-// datagrams until the stream, the destination or the association ends.
+// pumpUDP opens dst's stream and writes its queue to it.
 func (s *Server) pumpUDP(ctx context.Context, a *associate, key, target string, hdr []byte, dst *udpDest) {
 	defer s.dropDest(a, key, dst)
 
@@ -187,8 +181,7 @@ func (s *Server) pumpUDP(ctx context.Context, a *associate, key, target string, 
 	}
 }
 
-// dropDest forgets dst so the next datagram for its destination opens a
-// fresh stream.
+// dropDest makes the next datagram for the destination open a new stream.
 func (s *Server) dropDest(a *associate, key string, dst *udpDest) {
 	dst.stop()
 	a.mu.Lock()

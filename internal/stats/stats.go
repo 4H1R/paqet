@@ -30,8 +30,6 @@ func Run(ctx context.Context, interval time.Duration, conns func() []tnet.Conn) 
 		case now := <-t.C:
 			cur := kcp.DefaultSnmp.Copy()
 			line := Format(prev, cur, now.Sub(last), conns())
-			// Frames the kernel dropped because the capture buffer was
-			// full: KCP retransmits them, so any are worth knowing about.
 			if drops := socket.Drops(); drops > prevDrops {
 				line += fmt.Sprintf(" capture_drops=%d", drops-prevDrops)
 				prevDrops = drops

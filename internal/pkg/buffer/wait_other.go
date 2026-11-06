@@ -2,10 +2,10 @@
 
 package buffer
 
-// readableWaiter returns a syscall.RawConn.Read callback that completes
-// once the socket is readable. On Windows, RawConn.Read waits between
-// calls with a zero-byte overlapped read, which completes when data, EOF
-// or an error is pending, so the second call can report ready.
+// readableWaiter returns a RawConn.Read callback that waits for the socket
+// to become readable. On Windows RawConn.Read waits between calls with a
+// zero-byte read that completes on data, EOF or an error, so the second
+// call can report ready.
 func readableWaiter() func(fd uintptr) bool {
 	first := true
 	return func(uintptr) bool {

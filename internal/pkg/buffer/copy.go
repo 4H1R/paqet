@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"os"
 	"sync"
 	"syscall"
@@ -34,116 +33,91 @@ func GetUDP() *[]byte {
 	return bp
 }
 
-// PutUDP returns a buffer obtained from GetUDP to the pool.
+// PutUDP returns a buffer obtained from GetUDP.
 func PutUDP(bp *[]byte) { udpPool.Put(bp) }
 
-// idleRelease is how long a socket copy keeps its pooled buffer while no
-// data arrives. After that the buffer goes back to the pool and the copy
-// waits for the socket to become readable without holding one, so idle
-// connections cost no buffer memory.
+// idleRelease is how long a socket copy keeps its buffer without data.
 var idleRelease = 2 * time.Second
 
 var testHookIdleRelease func()
 
-// CopyT copies src to dst until EOF. A clean EOF returns nil.
-//
-// Sources that hand out their own buffers (smux streams implement WriterTo)
-// are drained without an extra copy. OS sockets also implement WriterTo, but
-// their generic fallback allocates a fresh 32KB buffer per call, so they use
-// a pooled buffer instead, released while the connection is idle.
-func CopyT(dst io.Writer, src io.Reader) error {
-	if wt, ok := src.(io.WriterTo); ok && !isOSConn(src) {
-		_, err := wt.WriteTo(dst)
-		return cleanEOF(err)
-	}
-	if c, ok := src.(osConn); ok {
-		if rc, err := c.SyscallConn(); err == nil {
-			return copyIdleAware(dst, c, rc)
-		}
-	}
-
-	bp := tcpPool.Get().(*[]byte)
-	buf := *bp
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			w, werr := dst.Write(buf[:n])
-			if werr != nil {
-				// Deliberately not returned to the pool: a failed write may
-				// still be referenced by dst. smux, for one, returns as soon
-				// as the session dies while its send loop can still be
-				// reading the frame.
-				return werr
-			}
-			if w < n {
-				tcpPool.Put(bp)
-				return io.ErrShortWrite
-			}
-		}
-		if err != nil {
-			tcpPool.Put(bp)
-			return cleanEOF(err)
-		}
-	}
-}
-
-type osConn interface {
-	net.Conn
+// socket is an OS socket whose readiness can be awaited without a buffer.
+type socket interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
 	SyscallConn() (syscall.RawConn, error)
 }
 
-// copyIdleAware is CopyT for OS sockets. It holds a pooled buffer while
-// data flows and gives it back after idleRelease without data.
-func copyIdleAware(dst io.Writer, src osConn, rc syscall.RawConn) error {
-	wait := readableWaiter()
+// CopyT copies src to dst until EOF. A clean EOF returns nil.
+//
+// Sources that hand out their own buffers (smux streams implement WriterTo)
+// are drained without an extra copy. Other sources are copied through a
+// pooled buffer; for OS sockets the buffer goes back to the pool while the
+// connection is idle, so idle connections hold no buffer memory.
+func CopyT(dst io.Writer, src io.Reader) error {
+	sock, isSock := src.(socket)
+	// OS sockets implement WriterTo too, but with a fresh 32KB buffer per call.
+	if wt, ok := src.(io.WriterTo); ok && !isSock {
+		_, err := wt.WriteTo(dst)
+		return cleanEOF(err)
+	}
+
+	var (
+		rc   syscall.RawConn
+		wait func(uintptr) bool
+	)
+	if isSock {
+		if rc, _ = sock.SyscallConn(); rc != nil {
+			wait = readableWaiter()
+		}
+	}
 	for {
-		// Block until data (or EOF, or an error) is ready, without a buffer.
-		if err := rc.Read(wait); err != nil {
-			return cleanEOF(err)
+		if rc != nil {
+			if err := rc.Read(wait); err != nil {
+				return cleanEOF(err)
+			}
+			// One deadline per busy period rather than per read; if it fires
+			// mid-transfer the loop just goes around once more.
+			sock.SetReadDeadline(time.Now().Add(idleRelease))
 		}
 
 		bp := tcpPool.Get().(*[]byte)
-		buf := *bp
-		// One deadline per active period, not per read: if it fires while
-		// data still flows, the loop just takes another trip around.
-		src.SetReadDeadline(time.Now().Add(idleRelease))
-		for {
-			n, err := src.Read(buf)
-			if n > 0 {
-				w, werr := dst.Write(buf[:n])
-				if werr != nil {
-					src.SetReadDeadline(time.Time{})
-					return werr // buffer may still be referenced; see CopyT
-				}
-				if w < n {
-					tcpPool.Put(bp)
-					src.SetReadDeadline(time.Time{})
-					return io.ErrShortWrite
-				}
-			}
-			if err != nil {
-				tcpPool.Put(bp)
-				if errors.Is(err, os.ErrDeadlineExceeded) {
-					if testHookIdleRelease != nil {
-						testHookIdleRelease()
-					}
-					break // idle: release the buffer and wait again
-				}
-				return cleanEOF(err)
-			}
+		reusable, err := copyBuffer(dst, src, *bp)
+		if reusable {
+			tcpPool.Put(bp)
 		}
-		if err := src.SetReadDeadline(time.Time{}); err != nil {
-			return err
+		if rc != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+			if testHookIdleRelease != nil {
+				testHookIdleRelease()
+			}
+			if err := sock.SetReadDeadline(time.Time{}); err != nil {
+				return err
+			}
+			continue
 		}
+		return cleanEOF(err)
 	}
 }
 
-func isOSConn(r io.Reader) bool {
-	switch r.(type) {
-	case *net.TCPConn, *net.UnixConn:
-		return true
+// copyBuffer copies until src or dst fails. reusable is false after a
+// failed write: dst may still reference buf (smux returns as soon as its
+// session dies while its send loop can still be reading the frame).
+func copyBuffer(dst io.Writer, src io.Reader, buf []byte) (reusable bool, err error) {
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			w, werr := dst.Write(buf[:n])
+			if werr != nil {
+				return false, werr
+			}
+			if w < n {
+				return true, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			return true, rerr
+		}
 	}
-	return false
 }
 
 func cleanEOF(err error) error {
@@ -153,33 +127,27 @@ func cleanEOF(err error) error {
 	return err
 }
 
-// Relay copies data both ways between a and b. It returns when either
-// direction ends or ctx is cancelled, with the first copy error (nil on a
-// clean EOF or cancellation). Relay closes a and b (if they implement
-// io.Closer) as soon as one direction ends so the other one unblocks;
-// callers may close them again.
-//
-// One direction runs on the calling goroutine, so a relay costs one extra
-// goroutine instead of two.
+// Relay copies data both ways between a and b until either direction ends
+// or ctx is cancelled, and returns the first copy error (nil on a clean EOF
+// or cancellation). It closes a and b, if they are io.Closers, as soon as
+// one direction ends so the other unblocks. One direction runs on the
+// calling goroutine.
 func Relay(ctx context.Context, a, b io.ReadWriter) error {
 	var (
 		once  sync.Once
 		first error
 	)
-	finish := func(err error, record bool) {
+	finish := func(err error) {
 		once.Do(func() {
-			if record {
-				first = err
-			}
+			first = err
 			closeRW(a)
 			closeRW(b)
 		})
 	}
-	stop := context.AfterFunc(ctx, func() { finish(nil, false) })
-	defer stop()
+	defer context.AfterFunc(ctx, func() { finish(nil) })()
 
-	go func() { finish(CopyT(a, b), true) }()
-	finish(CopyT(b, a), true)
+	go func() { finish(CopyT(a, b)) }()
+	finish(CopyT(b, a))
 	return first
 }
 

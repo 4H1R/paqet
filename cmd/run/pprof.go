@@ -9,9 +9,8 @@ import (
 	"os"
 )
 
-// Builds with -tags pprof serve net/http/pprof on $PAQET_PPROF (for
-// example 127.0.0.1:6060), for profiling and for collecting PGO profiles.
-// The tag keeps net/http out of release binaries.
+// With -tags pprof, paqet serves net/http/pprof on $PAQET_PPROF (e.g.
+// 127.0.0.1:6060). The tag keeps net/http out of release builds.
 func init() {
 	addr := os.Getenv("PAQET_PPROF")
 	if addr == "" {

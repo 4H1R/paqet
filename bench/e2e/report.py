@@ -4,13 +4,11 @@ import json
 import statistics
 import sys
 
-ORDER = ["old", "new-libpcap", "new-afpacket-1r", "new-afpacket-4r", "new"]
+ORDER = ["old", "new-libpcap", "new"]
 LABEL = {
     "old": "old (master)",
     "new-libpcap": "new, libpcap backend",
-    "new-afpacket-1r": "new, AF_PACKET, 1 reader",
-    "new-afpacket-4r": "new, AF_PACKET, 4 readers",
-    "new": "new (defaults)",
+    "new": "new",
 }
 
 

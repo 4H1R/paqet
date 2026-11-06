@@ -7,14 +7,9 @@ import (
 // packetOutgoing is PACKET_OUTGOING from linux/if_packet.h.
 const packetOutgoing = 4
 
-// captureFilter returns a classic BPF program, for Ethernet frames, that
-// accepts TCP over IPv4 or IPv6 to dstPort. It rejects IPv4 fragments and
-// IPv6 extension headers, as the frame decoder does. With inboundOnly it
-// also rejects frames the host sent, using the Linux packet type ancillary
-// field (Linux only; the field does not exist in a portable BPF VM).
-//
-// AF_PACKET delivers frames with VLAN tags already stripped, so no VLAN
-// handling is needed.
+// captureFilter accepts what decodeFrame accepts, sent to dstPort.
+// inboundOnly also rejects frames the host sent, using a Linux-only
+// ancillary field. AF_PACKET strips VLAN tags before filtering.
 func captureFilter(dstPort uint16, inboundOnly bool) ([]bpf.RawInstruction, error) {
 	return bpf.Assemble(captureProgram(dstPort, inboundOnly))
 }
@@ -42,8 +37,7 @@ func captureProgram(dstPort uint16, inboundOnly bool) []bpf.Instruction {
 		/* 15 reject */ bpf.RetConstant{Val: 0},
 	}
 	if inboundOnly {
-		// Prepend the direction check; the relative jumps above are
-		// unaffected. The reject target is 15+2 = 17 from instruction 1.
+		// Relative jumps above are unaffected; reject is now at 17.
 		prog = append([]bpf.Instruction{
 			bpf.LoadExtension{Num: bpf.ExtType},
 			bpf.JumpIf{Cond: bpf.JumpEqual, Val: packetOutgoing, SkipTrue: 15},

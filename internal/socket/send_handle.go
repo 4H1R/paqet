@@ -12,37 +12,38 @@ import (
 	"paqet/internal/pkg/iterator"
 )
 
-type tcpF struct {
-	tcpF       iterator.Iterator[conf.TCPF]
-	clientTCPF map[uint64]*iterator.Iterator[conf.TCPF]
-	mu         sync.RWMutex
-}
-
-// SendHandle builds frames and hands them to a transmit sink. It is safe
-// for concurrent use and can be shared by several PacketConns.
-type SendHandle struct {
-	sink      txSink
-	v4, v6    frameAddrs // templates; dstIP is filled in per packet
-	srcPort   uint16
-	time      uint32
-	tsCounter atomic.Uint32
-	tcpF      tcpF
-	bufs      sync.Pool // *[]byte frame buffers
-}
-
 var (
 	errNoIPv4 = errors.New("socket: no IPv4 address configured")
 	errNoIPv6 = errors.New("socket: no IPv6 address configured")
 )
 
-func newSendHandle(cfg *conf.Network, sink txSink) *SendHandle {
-	sh := &SendHandle{
-		sink:    sink,
-		srcPort: uint16(cfg.Port),
-		tcpF:    tcpF{tcpF: iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF}, clientTCPF: make(map[uint64]*iterator.Iterator[conf.TCPF])},
-		time:    uint32(time.Now().UnixNano() / int64(time.Millisecond)),
+// maxPayload is the largest packet kcp-go sends.
+const maxPayload = 1500
+
+// sendHandle builds frames and hands them to a transmit sink. It is safe
+// for concurrent use.
+type sendHandle struct {
+	sink      txSink
+	v4, v6    frameAddrs // dstIP is filled in per packet
+	srcPort   uint16
+	time      uint32
+	tsCounter atomic.Uint32
+	bufs      sync.Pool // *[]byte
+
+	flagsMu     sync.RWMutex
+	flags       iterator.Iterator[conf.TCPF]
+	clientFlags map[uint64]*iterator.Iterator[conf.TCPF] // guarded by flagsMu
+}
+
+func newSendHandle(cfg *conf.Network, sink txSink) *sendHandle {
+	h := &sendHandle{
+		sink:        sink,
+		srcPort:     uint16(cfg.Port),
+		time:        uint32(time.Now().UnixMilli()),
+		flags:       iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF},
+		clientFlags: make(map[uint64]*iterator.Iterator[conf.TCPF]),
 		bufs: sync.Pool{New: func() any {
-			b := make([]byte, 0, maxHdrLen+mtuLimit)
+			b := make([]byte, 0, maxHdrLen+maxPayload)
 			return &b
 		}},
 	}
@@ -52,20 +53,17 @@ func newSendHandle(cfg *conf.Network, sink txSink) *SendHandle {
 		srcMAC = cfg.Interface.HardwareAddr
 	}
 	if cfg.IPv4.Addr != nil {
-		sh.v4 = frameAddrs{srcMAC: srcMAC, dstMAC: cfg.IPv4.Router, srcIP: cfg.IPv4.Addr.IP.To4(), tos: tos}
+		h.v4 = frameAddrs{srcMAC: srcMAC, dstMAC: cfg.IPv4.Router, srcIP: cfg.IPv4.Addr.IP.To4(), tos: tos}
 	}
 	if cfg.IPv6.Addr != nil {
-		sh.v6 = frameAddrs{srcMAC: srcMAC, dstMAC: cfg.IPv6.Router, srcIP: cfg.IPv6.Addr.IP.To16(), tos: tos}
+		h.v6 = frameAddrs{srcMAC: srcMAC, dstMAC: cfg.IPv6.Router, srcIP: cfg.IPv6.Addr.IP.To16(), tos: tos}
 	}
-	return sh
+	return h
 }
 
-// mtuLimit is kcp-go's largest packet.
-const mtuLimit = 1500
-
 // segment fills the per-packet TCP fields. The sequence, ack and timestamp
-// values follow the pattern paqet has always sent.
-func (h *SendHandle) segment(dstPort uint16, f conf.TCPF) tcpSegment {
+// pattern is part of paqet's wire fingerprint and must not change.
+func (h *sendHandle) segment(dstPort uint16, f conf.TCPF) tcpSegment {
 	counter := h.tsCounter.Add(1)
 	tsVal := h.time + (counter >> 3)
 	s := tcpSegment{srcPort: h.srcPort, dstPort: dstPort, flags: f, tsVal: tsVal}
@@ -76,31 +74,27 @@ func (h *SendHandle) segment(dstPort uint16, f conf.TCPF) tcpSegment {
 		}
 	} else {
 		s.tsEcr = tsVal - (counter%200 + 50)
-		seq := h.time + (counter << 7)
-		s.seq = seq
-		s.ack = seq - (counter & 0x3FF) + 1400
+		s.seq = h.time + (counter << 7)
+		s.ack = s.seq - (counter & 0x3FF) + 1400
 	}
 	return s
 }
 
-// Write sends payload to dst in one frame.
-func (h *SendHandle) Write(payload []byte, dst *Addr) error {
-	var fa frameAddrs
+func (h *sendHandle) write(payload []byte, dst *Addr) error {
+	fa := h.v4
 	if len(dst.IP) == 16 {
-		if h.v6.srcIP == nil {
+		fa = h.v6
+	}
+	if fa.srcIP == nil {
+		if len(dst.IP) == 16 {
 			return errNoIPv6
 		}
-		fa = h.v6
-	} else {
-		if h.v4.srcIP == nil {
-			return errNoIPv4
-		}
-		fa = h.v4
+		return errNoIPv4
 	}
 	fa.dstIP = dst.IP
 
 	dstPort := uint16(dst.Port)
-	seg := h.segment(dstPort, h.getClientTCPF(dst.IP, dstPort))
+	seg := h.segment(dstPort, h.flagsFor(dst.IP, dstPort))
 
 	bp := h.bufs.Get().(*[]byte)
 	frame := encodeFrame(*bp, &fa, &seg, payload)
@@ -110,37 +104,33 @@ func (h *SendHandle) Write(payload []byte, dst *Addr) error {
 	return err
 }
 
-func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
-	h.tcpF.mu.RLock()
-	defer h.tcpF.mu.RUnlock()
-	if ff := h.tcpF.clientTCPF[hash.IPAddr(dstIP, dstPort)]; ff != nil {
-		return ff.Next()
+func (h *sendHandle) flagsFor(ip net.IP, port uint16) conf.TCPF {
+	h.flagsMu.RLock()
+	defer h.flagsMu.RUnlock()
+	if it := h.clientFlags[hash.IPAddr(ip, port)]; it != nil {
+		return it.Next()
 	}
-	return h.tcpF.tcpF.Next()
+	return h.flags.Next()
 }
 
-func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
+func (h *sendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 	a, ok := AddrOf(addr)
 	if !ok {
 		return
 	}
-	h.tcpF.mu.Lock()
-	h.tcpF.clientTCPF[hash.IPAddr(a.IP, uint16(a.Port))] = &iterator.Iterator[conf.TCPF]{Items: f}
-	h.tcpF.mu.Unlock()
+	h.flagsMu.Lock()
+	h.clientFlags[hash.IPAddr(a.IP, uint16(a.Port))] = &iterator.Iterator[conf.TCPF]{Items: f}
+	h.flagsMu.Unlock()
 }
 
-func (h *SendHandle) deleteClientTCPF(addr net.Addr) {
+func (h *sendHandle) deleteClientTCPF(addr net.Addr) {
 	a, ok := AddrOf(addr)
 	if !ok {
 		return
 	}
-	h.tcpF.mu.Lock()
-	delete(h.tcpF.clientTCPF, hash.IPAddr(a.IP, uint16(a.Port)))
-	h.tcpF.mu.Unlock()
+	h.flagsMu.Lock()
+	delete(h.clientFlags, hash.IPAddr(a.IP, uint16(a.Port)))
+	h.flagsMu.Unlock()
 }
 
-func (h *SendHandle) Close() {
-	if h.sink != nil {
-		h.sink.close()
-	}
-}
+func (h *sendHandle) close() { h.sink.close() }
