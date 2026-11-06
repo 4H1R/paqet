@@ -88,3 +88,52 @@ func TestAFPacketLoopback(t *testing.T) {
 		})
 	}
 }
+
+// TestAFPacketWake checks that wake unblocks a reader parked in the
+// netpoller once, and that the next read blocks again.
+func TestAFPacketWake(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root for AF_PACKET")
+	}
+	lo, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Skip("no loopback interface")
+	}
+	r, err := openRingRx(lo.Index, 40999, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.close()
+
+	read := func() <-chan error {
+		ch := make(chan error, 1)
+		go func() {
+			_, err := r.next()
+			ch <- err
+		}()
+		return ch
+	}
+
+	ch := read()
+	time.Sleep(50 * time.Millisecond)
+	r.wake()
+	select {
+	case err := <-ch:
+		if err != errTimeout {
+			t.Fatalf("woken read returned %v, want errTimeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wake did not unblock the reader")
+	}
+
+	ch = read()
+	select {
+	case err := <-ch:
+		t.Fatalf("read after a consumed wake returned at once: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	r.wake()
+	if err := <-ch; err != errTimeout {
+		t.Fatalf("second wake: %v", err)
+	}
+}

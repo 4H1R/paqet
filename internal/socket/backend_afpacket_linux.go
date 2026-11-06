@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -28,7 +30,6 @@ const afpacketSupported = true
 const (
 	ringFrameSize = captureSnapLen
 	ringBlockSize = 64 * 1024 // a multiple of both the page and frame size
-	ringPollMs    = 500       // bounds how long a missed wake can delay close
 
 	packetIgnoreOutgoing = 23 // PACKET_IGNORE_OUTGOING, Linux 4.20+
 )
@@ -76,16 +77,21 @@ func frameHdr(ring []byte, i int) *unix.Tpacket2Hdr {
 
 type ringRx struct {
 	fd      int
-	efd     int // eventfd for wake
+	file    *os.File // fd registered with Go's netpoller
+	rc      syscall.RawConn
+	ready   func(uintptr) bool
 	ring    []byte
 	nframes int
 	idx     int
 	held    bool // frame idx is owned by user space until the next call
 
-	mu      sync.Mutex // guards fds and stats against close
+	mu      sync.Mutex // guards the fd and stats against close
 	dropped uint64
 	closed  bool
 }
+
+// longAgo is a deadline in the past, used to wake a blocked reader.
+var longAgo = time.Unix(1, 0)
 
 func newAFPacketRx(cfg *conf.Network) (rxSource, error) {
 	r, err := openRingRx(cfg.Interface.Index, uint16(cfg.Port), cfg.PCAP.Sockbuf)
@@ -98,11 +104,11 @@ func newAFPacketRx(cfg *conf.Network) (rxSource, error) {
 func openRingRx(ifindex int, port uint16, bufBytes int) (r *ringRx, err error) {
 	// Protocol 0 captures nothing until bind, so the filter and ring are in
 	// place before the first frame arrives.
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("socket: %w", err)
 	}
-	r = &ringRx{fd: fd, efd: -1}
+	r = &ringRx{fd: fd}
 	defer func() {
 		if err != nil {
 			r.close()
@@ -126,8 +132,15 @@ func openRingRx(ifindex int, port uint16, bufBytes int) (r *ringRx, err error) {
 	if err = unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: htons(unix.ETH_P_ALL), Ifindex: ifindex}); err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
 	}
-	if r.efd, err = unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK); err != nil {
-		return nil, fmt.Errorf("eventfd: %w", err)
+	// Waiting through the netpoller parks a goroutine instead of blocking an
+	// OS thread in poll(), which made the scheduler hand off and start
+	// threads for nearly every received packet.
+	r.file = os.NewFile(uintptr(fd), "afpacket-rx")
+	if r.rc, err = r.file.SyscallConn(); err != nil {
+		return nil, fmt.Errorf("netpoller: %w", err)
+	}
+	r.ready = func(uintptr) bool {
+		return atomic.LoadUint32(&frameHdr(r.ring, r.idx).Status)&unix.TP_STATUS_USER != 0
 	}
 	// The kernel counts drops from socket creation; start from zero.
 	_, _ = unix.GetsockoptTpacketStats(fd, unix.SOL_PACKET, unix.PACKET_STATISTICS)
@@ -142,56 +155,25 @@ func (r *ringRx) next() ([]byte, error) {
 		r.held = false
 	}
 
-	hdr := frameHdr(r.ring, r.idx)
-	for atomic.LoadUint32(&hdr.Status)&unix.TP_STATUS_USER == 0 {
-		if err := r.wait(); err != nil {
+	if !r.ready(0) {
+		if err := r.rc.Read(r.ready); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				// Woken: consume the wake and let the caller re-check its state.
+				r.file.SetReadDeadline(time.Time{})
+				return nil, errTimeout
+			}
 			return nil, err
 		}
 	}
 
 	r.held = true
+	hdr := frameHdr(r.ring, r.idx)
 	start, end := int(hdr.Mac), int(hdr.Mac)+int(hdr.Snaplen)
 	if end > ringFrameSize {
 		return nil, nil // malformed descriptor; decoding rejects the empty frame
 	}
 	base := r.idx * ringFrameSize
 	return r.ring[base+start : base+end : base+end], nil
-}
-
-// wait blocks until the ring may have a frame. It returns errTimeout when
-// woken or after ringPollMs.
-func (r *ringRx) wait() error {
-	fds := [2]unix.PollFd{
-		{Fd: int32(r.fd), Events: unix.POLLIN},
-		{Fd: int32(r.efd), Events: unix.POLLIN},
-	}
-	n, err := unix.Poll(fds[:], ringPollMs)
-	switch {
-	case errors.Is(err, unix.EINTR):
-		return nil
-	case err != nil:
-		return err
-	case n == 0:
-		return errTimeout
-	case fds[1].Revents != 0:
-		var b [8]byte
-		_, _ = unix.Read(r.efd, b[:])
-		return errTimeout
-	case fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0:
-		// Reading SO_ERROR clears it. A downed interface comes back on its
-		// own, so keep waiting instead of failing the session.
-		soerr, err := unix.GetsockoptInt(r.fd, unix.SOL_SOCKET, unix.SO_ERROR)
-		if err != nil {
-			return err
-		}
-		if soerr != 0 && unix.Errno(soerr) != unix.ENETDOWN {
-			return unix.Errno(soerr)
-		}
-		if fds[0].Revents&unix.POLLIN == 0 {
-			return errTimeout
-		}
-	}
-	return nil
 }
 
 func (r *ringRx) drops() uint64 {
@@ -214,12 +196,9 @@ func (r *ringRx) collectDropsLocked() {
 func (r *ringRx) wake() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || r.efd < 0 {
-		return
+	if !r.closed && r.file != nil {
+		r.file.SetReadDeadline(longAgo)
 	}
-	var one [8]byte
-	binary.NativeEndian.PutUint64(one[:], 1)
-	_, _ = unix.Write(r.efd, one[:])
 }
 
 func (r *ringRx) close() {
@@ -233,9 +212,10 @@ func (r *ringRx) close() {
 	if r.ring != nil {
 		_ = unix.Munmap(r.ring)
 	}
-	_ = unix.Close(r.fd)
-	if r.efd >= 0 {
-		_ = unix.Close(r.efd)
+	if r.file != nil {
+		_ = r.file.Close()
+	} else {
+		_ = unix.Close(r.fd)
 	}
 }
 
