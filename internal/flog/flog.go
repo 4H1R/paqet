@@ -37,6 +37,13 @@ func init() {
 
 func SetLevel(l int) { lv.Store(int32(l)) }
 
+// Enabled reports whether level l is logged. Hot paths check it first:
+// arguments to a ...any function are boxed even if the message is dropped.
+func Enabled(l Level) bool {
+	mlv := Level(lv.Load())
+	return mlv != None && l >= mlv
+}
+
 func logf(l Level, format string, args ...any) {
 	mlv := Level(lv.Load())
 	if mlv == None || l < mlv {

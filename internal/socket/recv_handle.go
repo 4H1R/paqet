@@ -1,121 +1,123 @@
 package socket
 
 import (
-	"fmt"
+	"errors"
 	"net"
-	"runtime"
-	"slices"
 	"sync"
-	"time"
-
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
-
-	"paqet/internal/conf"
-	"paqet/internal/pkg/hash"
+	"sync/atomic"
 )
 
-type decoder struct {
-	parser  *gopacket.DecodingLayerParser
-	eth     layers.Ethernet
-	ip4     layers.IPv4
-	ip6     layers.IPv6
-	tcp     layers.TCP
-	decoded []gopacket.LayerType
+var errNoPayload = errors.New("socket: packet carries no payload")
+
+// skippable reports whether a read error only means "nothing usable yet".
+func skippable(err error) bool { return err == errTimeout || err == errNoPayload }
+
+// recvHandle decodes frames from a capture source. Payloads are not copied:
+// they alias the capture buffer, which close must not release while a
+// payload is in use.
+type recvHandle struct {
+	src  rxSource
+	port uint16
+
+	mu     sync.Mutex // held while a payload is in use
+	addrs  addrCache
+	frame  decodedFrame
+	reaped bool
+
+	closed atomic.Bool
 }
 
-// maxCachedAddrs bounds the source address cache. Clients use one source
-// per connection, so this is only reached by scans or spoofed traffic.
-const maxCachedAddrs = 4096
-
-type RecvHandle struct {
-	handle *pcap.Handle
-	dec    *decoder
-	addrs  map[uint64]*net.UDPAddr // guarded by mu
-	mu     sync.Mutex
+func newRecvHandle(src rxSource, port int) *recvHandle {
+	h := &recvHandle{src: src, port: uint16(port), addrs: make(addrCache)}
+	registerRx(h)
+	return h
 }
 
-func NewRecvHandle(cfg *conf.Network) (*RecvHandle, error) {
-	handle, err := newHandle(cfg, cfg.PCAP.Sockbuf, 65536, 100*time.Millisecond)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open pcap handle: %w", err)
-	}
-
-	// SetDirection is not fully supported on Windows Npcap, so skip it
-	if runtime.GOOS != "windows" {
-		if err := handle.SetDirection(pcap.DirectionIn); err != nil {
-			return nil, fmt.Errorf("failed to set pcap direction in: %v", err)
-		}
-	}
-
-	filter := fmt.Sprintf("tcp and dst port %d", cfg.Port)
-	if err := handle.SetBPFFilter(filter); err != nil {
-		return nil, fmt.Errorf("failed to set BPF filter: %w", err)
-	}
-
-	d := &decoder{decoded: make([]gopacket.LayerType, 0, 4)}
-	d.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &d.eth, &d.ip4, &d.ip6, &d.tcp)
-	d.parser.IgnoreUnsupported = true
-
-	return &RecvHandle{handle: handle, dec: d, addrs: make(map[uint64]*net.UDPAddr)}, nil
-}
-
-func (h *RecvHandle) Read(data []byte) (int, net.Addr, error) {
+// read waits for the next payload sent to the handle's port and passes it
+// to use. The payload is only valid during the call. Errors for which
+// skippable is true mean the caller should simply read again.
+func (h *recvHandle) read(use func(payload []byte, from *Addr)) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	err := h.readLocked(use)
+	h.mu.Unlock()
+	if h.closed.Load() {
+		h.reap()
+	}
+	return err
+}
 
-	zdata, _, err := h.handle.ZeroCopyReadPacketData()
+func (h *recvHandle) readLocked(use func([]byte, *Addr)) error {
+	if h.reaped || h.closed.Load() {
+		return net.ErrClosed
+	}
+	f, err := h.src.next()
 	if err != nil {
-		return 0, nil, err
+		return err
 	}
-
-	// Reads are serialized by mu, so one decoder is reused for every packet.
-	d := h.dec
-	if err := d.parser.DecodeLayers(zdata, &d.decoded); err != nil {
-		return 0, nil, errNoPayload
+	d := &h.frame
+	// The port is checked again because no filter covers the moment
+	// between opening a socket and attaching it.
+	if !decodeFrame(f, d) || d.dstPort != h.port || len(d.payload) == 0 {
+		return errNoPayload
 	}
-
-	var ip net.IP
-	var port int
-	var payload []byte
-	for _, t := range d.decoded {
-		switch t {
-		case layers.LayerTypeIPv4:
-			ip = d.ip4.SrcIP
-		case layers.LayerTypeIPv6:
-			ip = d.ip6.SrcIP
-		case layers.LayerTypeTCP:
-			port = int(d.tcp.SrcPort)
-			payload = d.tcp.Payload
-		}
-	}
-
-	if ip == nil || len(payload) == 0 {
-		return 0, nil, errNoPayload
-	}
-
-	return copy(data, payload), h.addr(ip, port), nil
+	use(d.payload, h.addrs.get(d.srcIP, d.srcPort))
+	return nil
 }
 
-// addr returns a shared *net.UDPAddr for the source, so steady traffic from a
-// peer allocates nothing. ip points into the capture buffer and is copied
-// before being cached. Callers must not modify the returned address.
-func (h *RecvHandle) addr(ip net.IP, port int) *net.UDPAddr {
-	key := hash.IPAddr(ip, uint16(port))
-	if a, ok := h.addrs[key]; ok && a.Port == port && a.IP.Equal(ip) {
-		return a
+// reap releases the source once closed and no reader holds mu. close stores
+// closed before trying the lock and read checks it after unlocking, so
+// whichever runs last reaps.
+func (h *recvHandle) reap() {
+	if !h.mu.TryLock() {
+		return
 	}
-	if len(h.addrs) >= maxCachedAddrs {
-		clear(h.addrs)
+	if !h.reaped {
+		h.reaped = true
+		unregisterRx(h)
+		h.src.close()
 	}
-	a := &net.UDPAddr{IP: slices.Clone(ip), Port: port}
-	h.addrs[key] = a
-	return a
+	h.mu.Unlock()
 }
 
-func (h *RecvHandle) Close() {
-	if h.handle != nil {
-		h.handle.Close()
+func (h *recvHandle) close() {
+	h.closed.Store(true)
+	h.src.wake()
+	h.reap()
+}
+
+// Kernel drop counters of all receive handles, for the stats line.
+var rxStats struct {
+	sync.Mutex
+	live        map[*recvHandle]struct{}
+	closedDrops uint64
+}
+
+func registerRx(h *recvHandle) {
+	rxStats.Lock()
+	defer rxStats.Unlock()
+	if rxStats.live == nil {
+		rxStats.live = make(map[*recvHandle]struct{})
 	}
+	rxStats.live[h] = struct{}{}
+}
+
+func unregisterRx(h *recvHandle) {
+	rxStats.Lock()
+	defer rxStats.Unlock()
+	if _, ok := rxStats.live[h]; ok {
+		delete(rxStats.live, h)
+		rxStats.closedDrops += h.src.drops()
+	}
+}
+
+// Drops returns how many received packets the kernel dropped because a
+// capture buffer was full.
+func Drops() uint64 {
+	rxStats.Lock()
+	defer rxStats.Unlock()
+	n := rxStats.closedDrops
+	for h := range rxStats.live {
+		n += h.src.drops()
+	}
+	return n
 }

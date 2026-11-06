@@ -7,6 +7,7 @@ import (
 
 	"paqet/internal/conf"
 	"paqet/internal/flog"
+	"paqet/internal/pkg/memtrim"
 	"paqet/internal/stats"
 	"paqet/internal/tnet"
 )
@@ -48,6 +49,7 @@ func (c *Client) Start(ctx context.Context) error {
 
 	go c.maintain(ctx)
 	go c.udpPool.ticker(ctx)
+	go memtrim.Run(ctx, stats.Traffic)
 	if c.cfg.Log.StatsInterval > 0 {
 		go stats.Run(ctx, c.cfg.Log.StatsInterval, c.sessions)
 	}

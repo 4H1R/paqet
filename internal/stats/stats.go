@@ -5,11 +5,13 @@ package stats
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/kcp-go/v5"
 
 	"paqet/internal/flog"
+	"paqet/internal/socket"
 	"paqet/internal/tnet"
 )
 
@@ -20,6 +22,7 @@ func Run(ctx context.Context, interval time.Duration, conns func() []tnet.Conn) 
 	defer t.Stop()
 
 	prev := kcp.DefaultSnmp.Copy()
+	prevDrops := socket.Drops()
 	last := time.Now()
 	for {
 		select {
@@ -27,10 +30,20 @@ func Run(ctx context.Context, interval time.Duration, conns func() []tnet.Conn) 
 			return
 		case now := <-t.C:
 			cur := kcp.DefaultSnmp.Copy()
-			flog.Statsf("%s", Format(prev, cur, now.Sub(last), conns()))
+			line := Format(prev, cur, now.Sub(last), conns())
+			if drops := socket.Drops(); drops > prevDrops {
+				line += fmt.Sprintf(" capture_drops=%d", drops-prevDrops)
+				prevDrops = drops
+			}
+			flog.Statsf("%s", line)
 			prev, last = cur, now
 		}
 	}
+}
+
+// Traffic returns the bytes KCP has sent and received so far.
+func Traffic() uint64 {
+	return atomic.LoadUint64(&kcp.DefaultSnmp.InBytes) + atomic.LoadUint64(&kcp.DefaultSnmp.OutBytes)
 }
 
 // Format renders the delta between two snapshots taken elapsed apart.

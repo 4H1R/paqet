@@ -45,6 +45,7 @@ network:
   # PCAP settings (optional - will use defaults)
   # pcap:
     # sockbuf: 4194304                        # 4MB buffer (default for client)
+    # backend: "auto"                         # auto (AF_PACKET on Linux, libpcap elsewhere), afpacket, libpcap
 
 # Server connection settings
 server:

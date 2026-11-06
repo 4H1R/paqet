@@ -1,106 +1,142 @@
 package socket
 
 import (
-	"errors"
-	"fmt"
 	"math/rand"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/gopacket/gopacket/pcap"
 
 	"paqet/internal/conf"
 )
 
+// PacketConn is a net.PacketConn over raw TCP frames.
+//
+// It also implements kcp-go's PacketPusher, which kcp-go prefers over
+// ReadFrom: a goroutine decodes each frame and hands kcp-go the payload
+// straight from the capture buffer.
 type PacketConn struct {
-	cfg           *conf.Network
-	sendHandle    *SendHandle
-	recvHandle    *RecvHandle
+	send          *sendHandle
+	recv          *recvHandle
 	readDeadline  atomic.Value
 	writeDeadline atomic.Value
+
+	recvFn  atomic.Pointer[func([]byte, net.Addr, error)]
+	pushMu  sync.Mutex
+	pushing bool // guarded by pushMu
+
+	closeOnce sync.Once
 }
 
+// New opens a PacketConn on cfg. A zero cfg.Port is replaced with a random
+// one.
 func New(cfg *conf.Network) (*PacketConn, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 32768 + rand.Intn(32768)
 	}
-
-	sendHandle, err := NewSendHandle(cfg)
+	rx, tx, err := openBackend(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create send handle on %s: %v", cfg.Interface.Name, err)
+		return nil, err
 	}
-
-	recvHandle, err := NewRecvHandle(cfg)
-	if err != nil {
-		sendHandle.Close()
-		return nil, fmt.Errorf("failed to create receive handle on %s: %v", cfg.Interface.Name, err)
-	}
-
-	conn := &PacketConn{
-		cfg:        cfg,
-		sendHandle: sendHandle,
-		recvHandle: recvHandle,
-	}
-
-	return conn, nil
+	return &PacketConn{send: newSendHandle(cfg, tx), recv: newRecvHandle(rx, cfg.Port)}, nil
 }
 
+// SetPacketReceiver implements kcp-go's PacketPusher. fn is never called
+// concurrently, and b is only valid during the call.
+func (c *PacketConn) SetPacketReceiver(fn func(b []byte, addr net.Addr, err error)) {
+	if fn == nil {
+		c.recvFn.Store(nil)
+		c.recv.src.wake()
+		return
+	}
+	c.recvFn.Store(&fn)
+	c.pushMu.Lock()
+	defer c.pushMu.Unlock()
+	if !c.pushing {
+		c.pushing = true
+		go c.pushLoop()
+	}
+}
+
+func (c *PacketConn) pushLoop() {
+	for {
+		fn := c.recvFn.Load()
+		if fn == nil {
+			if c.stopPushing() {
+				return
+			}
+			continue
+		}
+		err := c.recv.read(func(p []byte, from *Addr) { (*fn)(p, from, nil) })
+		if err == nil || skippable(err) {
+			continue
+		}
+		if fn := c.recvFn.Load(); fn != nil {
+			(*fn)(nil, nil, err)
+		}
+		c.pushMu.Lock()
+		c.pushing = false
+		c.pushMu.Unlock()
+		return
+	}
+}
+
+// stopPushing ends the push loop unless a receiver was set meanwhile.
+func (c *PacketConn) stopPushing() bool {
+	c.pushMu.Lock()
+	defer c.pushMu.Unlock()
+	if c.recvFn.Load() != nil {
+		return false
+	}
+	c.pushing = false
+	return true
+}
+
+// ReadFrom copies the next payload into data. It must not be used while a
+// packet receiver is set.
 func (c *PacketConn) ReadFrom(data []byte) (n int, addr net.Addr, err error) {
 	for {
-		if d, ok := c.readDeadline.Load().(time.Time); ok && !d.IsZero() && !time.Now().Before(d) {
+		if deadlinePassed(&c.readDeadline) {
 			return 0, nil, os.ErrDeadlineExceeded
 		}
-
-		n, addr, err := c.recvHandle.Read(data)
-		if err != nil {
-			if errors.Is(err, pcap.NextErrorTimeoutExpired) || errors.Is(err, errNoPayload) {
-				continue
-			}
-			return 0, nil, err
+		err := c.recv.read(func(p []byte, from *Addr) {
+			n, addr = copy(data, p), from
+		})
+		if !skippable(err) {
+			return n, addr, err
 		}
-
-		return n, addr, nil
 	}
 }
 
 func (c *PacketConn) WriteTo(data []byte, addr net.Addr) (n int, err error) {
-	if d, ok := c.writeDeadline.Load().(time.Time); ok && !d.IsZero() && !time.Now().Before(d) {
+	if deadlinePassed(&c.writeDeadline) {
 		return 0, os.ErrDeadlineExceeded
 	}
-
-	daddr, ok := addr.(*net.UDPAddr)
+	dst, ok := AddrOf(addr)
 	if !ok {
 		return 0, net.InvalidAddrError("invalid address")
 	}
-
-	err = c.sendHandle.Write(data, daddr)
-	if err != nil {
+	if err := c.send.write(data, dst); err != nil {
 		return 0, err
 	}
-
 	return len(data), nil
 }
 
+func deadlinePassed(v *atomic.Value) bool {
+	d, ok := v.Load().(time.Time)
+	return ok && !d.IsZero() && !time.Now().Before(d)
+}
+
 func (c *PacketConn) Close() error {
-	if c.sendHandle != nil {
-		c.sendHandle.Close()
-	}
-	if c.recvHandle != nil {
-		c.recvHandle.Close()
-	}
+	c.closeOnce.Do(func() {
+		c.recv.close()
+		c.send.close()
+	})
 	return nil
 }
 
-func (c *PacketConn) LocalAddr() net.Addr {
-	return nil
-	// return &net.UDPAddr{
-	// 	IP:   append([]byte(nil), c.cfg.PrimaryAddr().IP...),
-	// 	Port: c.cfg.PrimaryAddr().Port,
-	// 	Zone: c.cfg.PrimaryAddr().Zone,
-	// }
-}
+func (c *PacketConn) LocalAddr() net.Addr { return nil }
 
 func (c *PacketConn) SetDeadline(t time.Time) error {
 	c.readDeadline.Store(t)
@@ -118,14 +154,12 @@ func (c *PacketConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *PacketConn) SetDSCP(dscp int) error {
-	return nil
-}
+func (c *PacketConn) SetDSCP(int) error { return nil }
 
 func (c *PacketConn) SetClientTCPF(addr net.Addr, f []conf.TCPF) {
-	c.sendHandle.setClientTCPF(addr, f)
+	c.send.setClientTCPF(addr, f)
 }
 
 func (c *PacketConn) DeleteClientTCPF(addr net.Addr) {
-	c.sendHandle.deleteClientTCPF(addr)
+	c.send.deleteClientTCPF(addr)
 }
