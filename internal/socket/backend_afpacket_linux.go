@@ -262,8 +262,6 @@ const (
 	txMaxFrames = 4096
 )
 
-var errFrameTooLarge = errors.New("socket: frame too large")
-
 func newRingTx(ifindex, minFrames int) (t *ringTx, err error) {
 	// Protocol 0: the socket only sends. The kernel infers each frame's
 	// protocol from its Ethernet header.
